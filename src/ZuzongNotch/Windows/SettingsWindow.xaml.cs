@@ -752,6 +752,8 @@ public partial class SettingsWindow : Window
         if (EnableOnlineLyricsCheck != null) EnableOnlineLyricsCheck.IsEnabled = !isLocalOnly;
         if (CheckUpdateButton != null) CheckUpdateButton.IsEnabled = !isLocalOnly;
         if (DownloadUpdateButton != null) DownloadUpdateButton.IsEnabled = !isLocalOnly;
+        if (UpdateStatusText != null && (isLocalOnly || UpdateStatusText.Text == Loc.Get("settings.updates.offline")))
+            UpdateStatusText.Text = Loc.Get(isLocalOnly ? "settings.updates.offline" : "settings.updates.notChecked");
     }
 
     private void UpdatePrivacyNetworkSection(bool isLocalOnly, bool animate)
@@ -1194,10 +1196,10 @@ public partial class SettingsWindow : Window
     }
 
     private void CheckUpdate_Click(object sender, RoutedEventArgs e)
-        => MessageBox.Show(this, "Zuzong Dynamic dùng bản phát hành riêng. Theo dõi GitHub của Zuzong để nhận bản mới.", "Cập nhật Zuzong Dynamic");
+        => _updatePresenter.CheckForUpdatesAsync(forceRefresh: true).SafeFireAndForget("SETTINGS-MANUAL-UPDATE");
 
     private void DownloadUpdate_Click(object sender, RoutedEventArgs e)
-        => SafeLauncher.TryOpenUrl(ZuzongGithubUrl);
+        => _updatePresenter.DownloadUpdateAsync().SafeFireAndForget("SETTINGS-INSTALL-UPDATE");
 
     private void ViewChangelog_Click(object sender, RoutedEventArgs e)
         => _updatePresenter.ShowChangelog();

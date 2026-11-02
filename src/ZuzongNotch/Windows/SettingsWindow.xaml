@@ -2774,7 +2774,7 @@
                                                                Style="{StaticResource SettingTitleText}"
                                                                TextWrapping="Wrap"/>
                                                     <TextBlock x:Name="CurrentVersionText"
-                                                               Text="Current version: 2.1"
+                                                               Text="Current version"
                                                                Style="{StaticResource SettingHintText}"
                                                                Margin="0,4,0,0"/>
                                                 </StackPanel>

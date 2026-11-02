@@ -108,7 +108,20 @@ static class Program
                         Call(player, "PlayPauseButton_Click", player, click); await Task.Delay(250); Check(fake.PlayPauseCount == 1 && !vm.IsPlaying, "pause routes through media service");
                         Call(player, "PlayPauseButton_Click", player, click); await Task.Delay(250); Call(player, "NextButton_Click", player, click); await Task.Delay(250); Check(fake.PlayPauseCount == 2 && vm.IsPlaying && fake.NextTrackCount == 1, "resume and next route through media service");
                         File.WriteAllText(Path.Combine(Qa,"notch-command.json"),"{\"type\":\"appearance\"}");Call(main,"PollZuzong");var appearance=Application.Current.Windows.OfType<VNotch.Windows.ZuzongAppearanceWindow>().First(w=>w.IsVisible); await Task.Delay(250); Export(appearance, "appearance.png"); appearance.Close(); Check(true, "standalone appearance settings render");
-                        main.OpenZuzongAdvanced();var advanced=Application.Current.Windows.OfType<SettingsWindow>().First(w=>w.IsVisible); advanced.NavigateToSection("Donating"); await Task.Delay(650); Export(advanced, "support.png");
+                        main.OpenZuzongAdvanced();var advanced=Application.Current.Windows.OfType<SettingsWindow>().First(w=>w.IsVisible);
+                        var updateFixture=new UpdateFixture();var updateSettings=lean.Clone();updateSettings.AutoCheckUpdates=false;updateSettings.EnableLocalOnlyMode=false;
+                        NetworkPrivacy.Current.Apply(updateSettings);
+                        var updateWindow=new SettingsWindow(updateSettings,App.Services.GetRequiredService<ISettingsApplicationService>(),updateService:updateFixture); updateWindow.Show();updateWindow.NavigateToSection("Updates");await Task.Delay(500);
+                        Check(((TextBlock)updateWindow.FindName("CurrentVersionText")).Text.Contains(AppVersion.Current),"update page displays Zuzong assembly version");
+                        Check(((TextBlock)updateWindow.FindName("UpdateStatusText")).Text==Loc.Get("settings.updates.notChecked"),"update page does not claim latest before checking");
+                        NetworkPrivacy.Current.Apply(updateSettings);
+                        ((Button)updateWindow.FindName("CheckUpdateButton")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));await Task.Delay(100);
+                        Check(updateFixture.Checks>=1&&updateFixture.Forced,$"actual Check button calls GitHub updater and bypasses cache (calls={updateFixture.Checks}, forced={updateFixture.Forced}, online={NetworkPrivacy.Current.IsAllowed(NetworkFeature.Updates)})");
+                        Check(((Button)updateWindow.FindName("DownloadUpdateButton")).Visibility==Visibility.Visible,"new release reveals install action");
+                        ((Button)updateWindow.FindName("DownloadUpdateButton")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));await Task.Delay(100);
+                        Check(updateFixture.Downloads==1,"actual Download button calls verified installer service");
+                        Export(updateWindow,"updates.png");updateWindow.Close();
+                        advanced.NavigateToSection("Donating"); await Task.Delay(650); Export(advanced, "support.png");
                         Check(((Image)advanced.FindName("ZuzongSupportQr")).Source != null, "supplied support QR loads as embedded asset"); advanced.NavigateToSection("Spotlight"); await Task.Delay(650); Export(advanced, "ai-settings.png"); advanced.Close();
                         var tiktok=(Button)advanced.FindName("SocialWebsite");var github=(Button)advanced.FindName("SocialGitHub");
                         Check(tiktok.Opacity>.9&&github.Opacity>.9&&tiktok.Content is System.Windows.Controls.Viewbox vb&&vb.Child is System.Windows.Shapes.Path,"TikTok uses one vector path and both social icons remain visible");
@@ -126,6 +139,17 @@ static class Program
         thread.SetApartmentState(ApartmentState.STA); thread.Start(); thread.Join(); return exit;
     }
 
+    sealed class UpdateFixture : IUpdateService
+    {
+        public int Checks, Downloads;
+        public bool Forced;
+        public string CurrentVersion=>AppVersion.Current;
+        public UpdateInfo? LatestUpdateInfo=>new UpdateInfo {Version="99.0.0",IsNewerVersion=true};
+        public event EventHandler<UpdateInfo?>? UpdateCheckCompleted {add{} remove{}}
+        public Task<UpdateInfo?> CheckForUpdatesAsync(bool includePrereleases=false,bool forceRefresh=false){Checks++;Forced=forceRefresh;return Task.FromResult(LatestUpdateInfo);}
+        public Task<IReadOnlyList<UpdateInfo>> GetAllReleasesAsync()=>Task.FromResult<IReadOnlyList<UpdateInfo>>([]);
+        public Task<bool> DownloadAndInstallUpdateAsync(UpdateInfo info,IProgress<double>? progress=null,CancellationToken cancellationToken=default){Downloads++;return Task.FromResult(true);}
+    }
     static async Task CheckAi(bool live)
     {
         var settings = new NotchSettings { EnableLocalOnlyMode = false, AllowOnlineAi = true, SpotlightAiProvider = "Gemini", SpotlightGeminiApiKey = "test-key", SpotlightGeminiModel = "models/gemini-flash-lite-latest" };

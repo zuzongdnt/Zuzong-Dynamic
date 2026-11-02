@@ -1,4 +1,5 @@
 {
+  "settings.updates.offline": "Updates are blocked. Turn off Local-only mode in Privacy to check GitHub.",
   "settings.updates.notChecked": "Updates have not been checked yet.",
   "settings.updates.noReleases": "No compatible release has been published on GitHub.",
   "clipboard.addLabel": "Add label",

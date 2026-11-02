@@ -75,7 +75,9 @@ internal static class InstallerQa
         try
         {
             string workspace = Path.GetFullPath(args[0]).TrimEnd(Path.DirectorySeparatorChar);
-            Root = Path.Combine(workspace, "work", "installer-qa101");
+            string version = args.Length > 1 && !args[1].StartsWith("--") ? args[1] : "1.0.3";
+            string suffix = version.Replace(".", "");
+            Root = Path.Combine(workspace, "work", "installer-qa" + suffix);
             Check(Root.StartsWith(workspace + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase), "QA installation stays inside workspace");
             string install = Path.Combine(Root, "Installed");
             if (Directory.Exists(install))
@@ -89,14 +91,14 @@ internal static class InstallerQa
             Desktop = "ZuzongInstallerQA-" + Process.GetCurrentProcess().Id;
             desktop = CreateDesktop(Desktop, IntPtr.Zero, IntPtr.Zero, 0, 0xCF, IntPtr.Zero);
             Check(desktop != IntPtr.Zero, "private desktop created without switching the user desktop");
-            string setup = Path.Combine(workspace, "work", "installer-test-build101", "ZuzongDynamic-Setup-QA.exe");
+            string setup = Path.Combine(workspace, "work", "installer-test-build" + suffix, "ZuzongDynamic-Setup-QA.exe");
             string options = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS /NOICONS /TASKS=\"\" /LANG=vietnamese";
             Check(Run(setup, options + " /DIR=\"" + install + "\" /LOG=\"" + Path.Combine(Root, "install.log") + "\"", 180000) == 0, "setup installs successfully without launching the app");
-            string bin = Path.Combine(install, "versions", "1.0.1");
+            string bin = Path.Combine(install, "versions", version);
             string app = Path.Combine(bin, "ZuzongDynamic.exe");
             Check(File.Exists(app) && File.Exists(Path.Combine(install, "unins000.exe")), "application and Windows uninstaller are installed");
             Check(File.Exists(Path.Combine(bin, "coreclr.dll")) && File.Exists(Path.Combine(bin, "PresentationFramework.dll")), "installed app includes CLR and WPF runtime");
-            Check(!File.Exists(Path.Combine(install, "Bridge", "config.json")) && !Directory.Exists(Path.Combine(install, "NotchFull")), "no personal credentials or machine-specific notify config installed");
+            Check(!File.Exists(Path.Combine(bin, "Bridge", "config.json")) && !Directory.Exists(Path.Combine(bin, "NotchFull")), "no personal credentials or machine-specific notify config installed");
             const string uninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\ZuzongDynamic.QA_is1";
             using (var key = Registry.CurrentUser.OpenSubKey(uninstallKey)) Check(key != null && (string)key.GetValue("DisplayName") == "Zuzong Dynamic QA", "per-user Apps and Features entry registered");
             using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run")) Check(key == null || key.GetValue("ZuzongDynamic.QA") == null, "unchecked autostart is not enabled");

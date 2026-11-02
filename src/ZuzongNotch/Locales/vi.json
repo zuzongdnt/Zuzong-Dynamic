@@ -1,7 +1,7 @@
 {
-  "settings.updates.offline": "C?p nh?t ?ang b? ch?n. M? Quy?n ri?ng t? v? t?t ?Ch? d?ng ngo?i tuy?n? ?? ki?m tra GitHub.",
-  "settings.updates.notChecked": "Ch?a ki?m tra b?n c?p nh?t.",
-  "settings.updates.noReleases": "Ch?a c? b?n ph?t h?nh ph? h?p tr?n GitHub.",
+  "settings.updates.offline": "Cập nhật đang bị chặn. Mở Quyền riêng tư và tắt “Chỉ dùng ngoại tuyến” để kiểm tra GitHub.",
+  "settings.updates.notChecked": "Chưa kiểm tra bản cập nhật.",
+  "settings.updates.noReleases": "Chưa có bản phát hành phù hợp trên GitHub.",
   "clipboard.addLabel": "Thêm nhãn",
   "clipboard.selectAll": "Chọn tất cả mục đang hiển thị",
   "clipboard.deleteSelected": "Xóa {0} mục đã chọn",

@@ -1,5 +1,5 @@
 ﻿#ifndef AppVersion
-  #define AppVersion "1.0.3"
+  #define AppVersion "1.0.4"
 #endif
 #ifndef PayloadDir
   #define PayloadDir "..\work\setup-payload"
@@ -21,6 +21,8 @@
 ; Versioned payloads let Windows finish releasing a crashed old image without
 ; blocking a repair install. Shortcuts and startup always select this version.
 #define AppBin "versions\" + AppVersion
+#define VersionDash Pos("-", AppVersion)
+#define NumericVersion (VersionDash > 0 ? Copy(AppVersion, 1, VersionDash - 1) : AppVersion)
 
 [Setup]
 AppId={#ProductId}
@@ -54,7 +56,7 @@ SolidCompression=yes
 LZMANumBlockThreads=2
 LicenseFile=..\src\ZuzongNotch\LICENSE
 InfoBeforeFile=InstallerNotes.txt
-VersionInfoVersion={#AppVersion}.0
+VersionInfoVersion={#NumericVersion}.0
 VersionInfoCompany=Zuzong
 VersionInfoDescription=Zuzong Dynamic Installer
 VersionInfoCopyright=Zuzong; based on V-Notch by w0otdev (Apache-2.0)

@@ -1,20 +1,13 @@
 # Bộ cài Zuzong Dynamic
 
-File phát hành: `outputs/ZuzongDynamic-Setup-1.0.0-x64.exe`.
+Tải bộ cài tại https://github.com/zuzongdnt/Zuzong-Dynamic/releases . Tệp có dạng `ZuzongDynamic-Setup-<Version>-x64.exe`, đã kèm .NET Desktop Runtime.
 
-Người dùng chỉ cần nhận một file này, mở lên rồi làm theo trình cài đặt. Không cần giải nén ZIP hoặc cài .NET riêng. App được cài cho tài khoản Windows hiện tại, mặc định ở `%LOCALAPPDATA%\Programs\ZuzongDynamic`; dữ liệu riêng ở `%LOCALAPPDATA%\ZuzongDynamic`.
+Chạy `installer/build.ps1 -Compiler "C:\path\ISCC.exe"` trên Windows với .NET SDK 8+ và Inno Setup 7. Script đọc phiên bản từ csproj, xuất bộ cài và SHA-256 trong `outputs`. App cài tại `versions/<Version>`, hồ sơ riêng ở `%LOCALAPPDATA%\ZuzongDynamic`.
 
-- Windows 10 bản 2004 trở lên / Windows 11, x64.
-- Có lựa chọn shortcut Desktop và tự chạy khi đăng nhập.
-- Có mục gỡ trong Settings → Apps. Khi gỡ, các cấu hình ở hồ sơ riêng được giữ lại.
-- Bộ cài không tự đóng app đang chạy. Bản cài đặt có mutex để yêu cầu thoát app trước khi cập nhật hoặc gỡ.
-- Không kèm API key, phiên đăng nhập, lịch sử clipboard hay cấu hình notify của Zuzong. Mỗi người tự kết nối API/Spotify nếu sử dụng.
-- Tính năng trực tuyến cần Internet. Phiên đăng nhập Spotify nhúng cho Canvas/lời bài hát còn cần WebView2 Runtime; luồng Spotify qua trình duyệt dùng trình duyệt mặc định.
+Workflow `.github/workflows/release.yml` kiểm tra tag, thử updater, dựng bộ cài và đăng GitHub Release. Tag `v<Version>` phải khớp csproj. Bản beta dùng `<Version>1.0.5-beta.1</Version>`, còn AssemblyVersion/FileVersion giữ dạng số `1.0.5.0`.
 
-`ZuzongDynamic.iss` dùng Inno Setup 7. Compiler bản dựng này là Tools.InnoSetup 7.1.0; đã kiểm tra Authenticode hợp lệ trước khi chạy. Inno Setup: https://jrsoftware.org/.
+Không đưa API key, cấu hình notify theo máy, phiên Spotify hoặc lịch sử clipboard vào gói. Bộ cài giữ hồ sơ và lựa chọn khởi động cùng Windows khi nâng cấp. Nếu app còn giữ khóa, cần thoát trước. Updater đối chiếu SHA-256 do GitHub tính, chờ app thoát, cài rồi mở lại.
 
-Để dựng lại, dùng .NET SDK và chạy `installer/build.ps1 -Compiler "đường dẫn ISCC.exe"`. Script tạo payload .NET self-contained rồi nén thành Setup.exe. Native DLL và shader có sẵn trong nguồn; không cần dựng lại native khi dùng các cờ trong script.
+`InstallerQa.cs` dùng desktop và AppId QA riêng. Truyền workspace và phiên bản, ví dụ `InstallerQa.exe E:\appzuzong 1.0.3`. Bộ cài QA cần nằm tại `work/installer-test-build103/ZuzongDynamic-Setup-QA.exe`.
 
-`InstallerQa.cs` là bộ thử riêng. Nó dùng một desktop riêng, không chuyển desktop của người dùng, và AppId QA tách biệt. Đã kiểm tra cài/gỡ, đăng ký Apps & Features, lựa chọn startup tắt, chạy app với CLR nằm trong thư mục cài đặt, chặn gỡ khi app còn chạy, và giữ nguyên hồ sơ sau khi gỡ.
-
-Bản dựng chưa có chữ ký số của nhà phát hành Zuzong. SHA-256 nằm cạnh file cài đặt. Chưa thử trên máy Windows vật lý thứ hai; kiểm tra runtime đã xác nhận tiến trình dùng CLR kèm trong gói thay vì CLR cài trên máy thử.
+Bộ cài chưa có chứng thư ký mã của Zuzong. Chưa thử reboot thật hoặc máy vật lý thứ hai.

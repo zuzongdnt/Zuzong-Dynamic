@@ -41,10 +41,8 @@ Máy hiện tại giữ kết nối thông báo Codex qua `Bridge/ZuzongNotify.e
 
 `QA` có kết quả kiểm tra và ảnh render từ chính cây giao diện WPF trên desktop thử riêng, không chụp desktop người dùng. Bố cục media đã thử ở rộng 320/480, sát mép/viên thuốc, không tiện ích và CPU/RAM. Kiểm tra các nút phát dùng dịch vụ nhạc giả để không tác động video đang xem. Lần thử video thật có ảnh 558×558 sau khoảng 2,3 giây; độ trễ còn phụ thuộc dữ liệu Windows và mạng.
 
-Mã sửa ở `Source/src/ZuzongNotch`, kiểm tra ở `Source/tests/ZuzongQA`. Dựng bằng .NET SDK trên Windows:
+Mã nguồn và bộ cài: https://github.com/zuzongdnt/Zuzong-Dynamic . Hướng dẫn dựng lại nằm trong README của repo. Bộ cài Setup.exe đã kèm .NET 8 Desktop Runtime x64; không cần cài runtime riêng.
 
-`dotnet publish Source/src/ZuzongNotch/V-Notch.csproj -c Release -p:SkipNativeCompile=true -p:SkipShaderCompile=true --no-self-contained`
-
-Gói phát hành cần **.NET 8 Desktop Runtime x64**; máy Zuzong đang có sẵn. Native DLL và shader đã kèm. Không đóng gói lại font SF Pro.
+Mở **Cài đặt nâng cao → Cập nhật → Kiểm tra** để tìm bản mới. Có thể bật kiểm tra nền và nhận bản beta. Nếu các nút bị khóa, xem thông báo chế độ ngoại tuyến; chỉ tắt chế độ này trong Quyền riêng tư khi muốn dùng mạng. App đối chiếu SHA-256 trước khi cài, giữ hồ sơ riêng và mở lại sau nâng cấp.
 
 Zuzong Dynamic là bản sửa từ V-Notch 2.2.2 của w0otdev, theo Apache 2.0. Giữ bản quyền, LICENSE, THIRD_PARTY_NOTICES và nguồn gốc của các thành phần. Không nhận là mã gốc hoàn toàn của Zuzong.

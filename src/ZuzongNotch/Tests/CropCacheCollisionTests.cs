@@ -1,0 +1,150 @@
+using System.IO;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using VNotch.Services;
+using Xunit;
+
+namespace VNotch.Tests;
+
+[Collection("Localization")]
+public sealed class CropCacheCollisionTests
+{
+    [Fact]
+    public void EquivalentSquareArtworkReusesTheCachedNoOpResult() => SharedStaTestRunner.Run(() =>
+    {
+        var pixels = new byte[100 * 100 * 4];
+        new Random(7981).NextBytes(pixels);
+        var first = CreateBitmapImage(100, 100, pixels);
+        var equivalent = CreateBitmapImage(100, 100, pixels);
+        using var service = new MediaArtworkService();
+        var result = service.CropToSquare(first, "test");
+        Assert.Same(first, result);
+        Assert.Same(result, service.CropToSquare(equivalent, "test"));
+    });
+
+    [Fact]
+    public void CropOptionsDoNotReuseTheWrongCachedResult() => SharedStaTestRunner.Run(() =>
+    {
+        var pixels = new byte[100 * 60 * 4];
+        new Random(876).NextBytes(pixels);
+        var source = CreateBitmapImage(100, 60, pixels);
+        using var service = new MediaArtworkService();
+        var normal = service.CropToSquare(source, "test");
+        var centered = service.CropToSquare(source, "test", forceCenterCrop: true);
+        Assert.NotNull(normal);
+        Assert.NotNull(centered);
+        Assert.NotSame(normal, centered);
+        service.ConfigureSmartCrop(true);
+        var smart = service.CropToSquare(source, "test");
+        Assert.NotNull(smart);
+        Assert.NotSame(normal, smart);
+        service.ConfigureSmartCrop(false);
+        Assert.Same(normal, service.CropToSquare(source, "test"));
+    });
+
+    [Fact]
+    public void MutableNoOpSourcesAreNotSharedThroughTheCache() => SharedStaTestRunner.Run(() =>
+    {
+        var pixels = new byte[64 * 64 * 4];
+        new Random(141).NextBytes(pixels);
+        var source = BitmapSource.Create(64, 64, 96, 96, PixelFormats.Bgra32, null, pixels, 64 * 4);
+        var equivalent = source.CloneCurrentValue();
+        using var service = new MediaArtworkService();
+        Assert.Same(source, service.CropToSquare(source, "test"));
+        Assert.Same(equivalent, service.CropToSquare(equivalent, "test"));
+        Assert.False(source.IsFrozen);
+    });
+
+    [Fact]
+    public void TwoImagesWithIdenticalSamplePoints_HaveDifferentFingerprintsAndDoNotCollideInCropCache()
+    {
+        SharedStaTestRunner.Run(() =>
+        {
+            int w = 100;
+            int h = 60;
+
+            // Generate two images sharing identical 25 black grid sample points
+            // but differing completely in internal regions.
+            var pixelsA = CreateCollidingSampleGridPixels(w, h, fillByte: 50);
+            var pixelsB = CreateCollidingSampleGridPixels(w, h, fillByte: 200);
+
+            var sourceA = CreateBitmapImage(w, h, pixelsA);
+            var sourceB = CreateBitmapImage(w, h, pixelsB);
+
+            // 1. Verify ArtworkFingerprint differentiates them
+            var fpA = ArtworkFingerprint.Create(sourceA);
+            var fpB = ArtworkFingerprint.Create(sourceB);
+
+            Assert.NotEqual(fpA, fpB);
+
+            // 2. Verify CropToSquare does not return image A when image B is cropped
+            using var service = new MediaArtworkService();
+            var croppedA = service.CropToSquare(sourceA, "testMedia", forceCenterCrop: true);
+            var croppedB = service.CropToSquare(sourceB, "testMedia", forceCenterCrop: true);
+
+            Assert.NotNull(croppedA);
+            Assert.NotNull(croppedB);
+            Assert.NotSame(croppedA, croppedB);
+        });
+    }
+
+    private static byte[] CreateCollidingSampleGridPixels(int w, int h, byte fillByte)
+    {
+        var pixels = new byte[w * h * 4];
+
+        int[] xs = { 0, w / 4, w / 2, 3 * w / 4, w - 1 };
+        int[] ys = { 0, h / 4, h / 2, 3 * h / 4, h - 1 };
+
+        // Fill background with distinct fillByte
+        for (int i = 0; i < pixels.Length; i += 4)
+        {
+            pixels[i] = fillByte;
+            pixels[i + 1] = fillByte;
+            pixels[i + 2] = fillByte;
+            pixels[i + 3] = 255;
+        }
+
+        // Overwrite the 25 grid points (or even whole grid lines) with pure black
+        foreach (int y in ys)
+        {
+            foreach (int x in xs)
+            {
+                int idx = (y * w + x) * 4;
+                pixels[idx] = 0;
+                pixels[idx + 1] = 0;
+                pixels[idx + 2] = 0;
+                pixels[idx + 3] = 255;
+            }
+        }
+
+        return pixels;
+    }
+
+    private static BitmapImage CreateBitmapImage(int width, int height, byte[] pixels)
+    {
+        var bsource = BitmapSource.Create(
+            width,
+            height,
+            96,
+            96,
+            PixelFormats.Bgra32,
+            null,
+            pixels,
+            width * 4);
+
+        using var ms = new MemoryStream();
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(bsource));
+        encoder.Save(ms);
+        ms.Position = 0;
+
+        var img = new BitmapImage();
+        img.BeginInit();
+        img.CacheOption = BitmapCacheOption.OnLoad;
+        img.StreamSource = ms;
+        img.EndInit();
+        img.Freeze();
+
+        return img;
+    }
+}

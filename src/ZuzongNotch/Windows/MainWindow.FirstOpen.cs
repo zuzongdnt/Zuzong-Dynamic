@@ -1,0 +1,104 @@
+using System.Windows;
+using VNotch.Models;
+using VNotch.Services;
+
+namespace VNotch;
+
+public partial class MainWindow
+{
+    private SettingsWindow? _preparedSettingsWindow;
+    private SettingsWindow? _activeSettingsWindow;
+    private NotchSettings? _preparedSettingsSnapshot;
+    private bool _firstOpenUiPrepared;
+
+    private SettingsWindow CreateSettingsWindow(bool prepareForFirstShow = false) => new(
+        _settings, _settingsService, _spotlightController.IsHotkeyRegistered,
+        _updateService, prepareForFirstShow,
+        clipboardHotkeyError: () => ClipboardHotkeyRegistrationError,
+        invisibleHotkeyRegistered: () => IsInvisibleHotkeyRegistered)
+    { Owner = this };
+
+    private void PrepareFirstOpenUi()
+    {
+        if (_firstOpenUiPrepared || _cleanedUp) return;
+        _firstOpenUiPrepared = true;
+        PrepareExpandedContentForFirstOpen();
+        PrepareSecondaryContentForFirstOpen();
+        // Build the full settings window only when opened. A background launch
+        // should not retain its entire XAML tree, native HWND and preview data.
+    }
+
+    private void PrepareSecondaryContentForFirstOpen()
+    {
+        if (SecondaryContent == null) return;
+        var visibility = SecondaryContent.Visibility;
+        double opacity = SecondaryContent.Opacity;
+        double targetWidth = Math.Max(0, ClipboardTrayWidth - SecondaryContent.Margin.Left - SecondaryContent.Margin.Right);
+        double targetHeight = Math.Max(0, ClipboardTrayHeight - SecondaryContent.Margin.Top - SecondaryContent.Margin.Bottom);
+        try
+        {
+            SecondaryContent.Opacity = 0;
+            SecondaryContent.Visibility = Visibility.Visible;
+            SecondaryContent.Width = targetWidth;
+            SecondaryContent.Height = targetHeight;
+            SecondaryContent.Measure(new Size(targetWidth, targetHeight));
+            SecondaryContent.Arrange(new Rect(0, 0, targetWidth, targetHeight));
+        }
+        finally
+        {
+            SecondaryContent.Visibility = visibility;
+            SecondaryContent.Opacity = opacity;
+        }
+    }
+
+    private void PrepareExpandedContentForFirstOpen()
+    {
+        var visibility = ExpandedContent.Visibility;
+        double opacity = ExpandedContent.Opacity;
+        double targetWidth = Math.Max(0, _expandedWidth - ExpandedContentHorizontalInset);
+        double targetHeight = Math.Max(0, _expandedHeight - ExpandedContentVerticalInset);
+        try
+        {
+            ExpandedContent.Opacity = 0;
+            ExpandedContent.Visibility = Visibility.Visible;
+            ExpandedContent.Width = targetWidth;
+            ExpandedContent.Height = targetHeight;
+            ExpandedContent.Measure(new Size(targetWidth, targetHeight));
+            ExpandedContent.Arrange(new Rect(0, 0, targetWidth, targetHeight));
+            PrepareExpandedContentLayoutForReveal();
+            EnsureCachedThumbnailExpandTarget();
+        }
+        finally
+        {
+            ExpandedContent.Visibility = visibility;
+            ExpandedContent.Opacity = opacity;
+        }
+    }
+
+    private SettingsWindow TakeSettingsWindow()
+    {
+        var prepared = _preparedSettingsWindow;
+        _preparedSettingsWindow = null;
+        var snapshot = _preparedSettingsSnapshot;
+        _preparedSettingsSnapshot = null;
+        if (prepared == null) return CreateSettingsWindow();
+
+        prepared.ActivatePreparedWindow(
+            _settings,
+            snapshotMatches: snapshot?.ValueEquals(_settings) == true,
+            _spotlightController.IsHotkeyRegistered);
+        return prepared;
+    }
+
+    private void DiscardPreparedSettingsWindow()
+    {
+        var active = _activeSettingsWindow;
+        _activeSettingsWindow = null;
+        active?.Close();
+
+        var prepared = _preparedSettingsWindow;
+        _preparedSettingsWindow = null;
+        _preparedSettingsSnapshot = null;
+        prepared?.Close();
+    }
+}

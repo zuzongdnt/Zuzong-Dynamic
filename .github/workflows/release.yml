@@ -1,0 +1,46 @@
+name: Release Zuzong Dynamic
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content -Raw src/ZuzongNotch/V-Notch.csproj)).Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Run this workflow from the matching version tag.' }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Install Inno Setup compiler
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force work/inno | Out-Null
+          Invoke-WebRequest https://www.nuget.org/api/v2/package/Tools.InnoSetup/7.1.0 -OutFile work/inno.zip
+          Expand-Archive work/inno.zip work/inno -Force
+          $signature = Get-AuthenticodeSignature work/inno/tools/ISCC.exe
+          if ($signature.Status -ne 'Valid') { throw 'Inno Setup signature is not valid.' }
+      - name: Test updater
+        shell: pwsh
+        run: |
+          dotnet run --project tests/ZuzongUpdateQA -c Release -p:SkipNativeCompile=true -p:SkipShaderCompile=true -- --isolated-data --settings "$env:RUNNER_TEMP/update-qa/notch.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Updater checks failed.' }
+      - name: Build self-contained installer
+        shell: pwsh
+        run: ./installer/build.ps1 -Compiler "$pwd/work/inno/tools/ISCC.exe"
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $arguments = @('release', 'create', "v$env:APP_VERSION", "outputs/ZuzongDynamic-Setup-$env:APP_VERSION-x64.exe", "outputs/ZuzongDynamic-Setup-$env:APP_VERSION-x64.exe.sha256", '--title', "Zuzong Dynamic $env:APP_VERSION", '--generate-notes', '--verify-tag')
+          if ($env:APP_VERSION.Contains('-')) { $arguments += '--prerelease' }
+          gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }

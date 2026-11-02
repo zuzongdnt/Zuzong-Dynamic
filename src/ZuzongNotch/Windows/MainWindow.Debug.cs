@@ -1,0 +1,257 @@
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Media;
+using VNotch.Models;
+using VNotch.Services;
+
+namespace VNotch;
+
+public partial class MainWindow
+{
+    private bool _isDebugModeEnabled = false;
+    private long _lastFpsUpdate = 0;
+    private double _currentMeasuredFps = 0;
+    private int _currentDisplayHz = 0;
+    private DebugWindow? _debugWindow;
+
+    internal void ToggleDebugMode(bool enable)
+    {
+        if (_isDebugModeEnabled == enable) return;
+
+        _isDebugModeEnabled = enable;
+
+        if (enable)
+        {
+            if (_debugWindow == null)
+            {
+                _debugWindow = new DebugWindow(new DebugWindowOptions
+                {
+                    InitialX = _settings.DebugWindowX,
+                    InitialY = _settings.DebugWindowY,
+                    OnClose = () =>
+                    {
+                        _settings.EnableDebugMode = false;
+                        _settingsService.SaveAsync(_settings).SafeFireAndForget("SETTINGS-SAVE");
+                        ToggleDebugMode(false);
+                    },
+                    OnPositionChanged = (x, y) =>
+                    {
+                        _settings.DebugWindowX = x;
+                        _settings.DebugWindowY = y;
+                        _settingsService.SaveAsync(_settings).SafeFireAndForget("SETTINGS-SAVE");
+                    },
+                    LiveMetricsProvider = () =>
+                    {
+                        PerformanceDiagnosticService.Instance.PingDispatcher(Dispatcher);
+                        return (_currentMeasuredFps, _currentDisplayHz, _currentMeasuredFrameTimeMs, _lastNetDownBytesPerSec, _lastNetUpBytesPerSec);
+                    },
+                    OnLockViewChanged = (locked) => SetDebugViewLock(locked),
+                    OnDragNotchChanged = (draggable) => SetDebugDraggable(draggable),
+                    OnViewStateChanged = (state) => SetDebugViewState(state),
+                    OnResetPosition = () => ResetNotchPosition()
+                });
+            }
+            _debugWindow.Show();
+            _debugWindow.Activate();
+
+            CompositionTarget.Rendering -= CompositionTarget_Rendering_DebugFps;
+            CompositionTarget.Rendering += CompositionTarget_Rendering_DebugFps;
+            _lastFpsUpdate = Stopwatch.GetTimestamp();
+            _fpsWindowStartTicks = _lastFpsUpdate;
+            _lastFrameTimestamp = _lastFpsUpdate;
+            _currentMeasuredFrameTimeMs = 0;
+            _fpsWindowFrameCount = 0;
+
+            UpdateRefreshRate();
+
+            GpuMonitorService.Instance.Start();
+
+            if (!_systemMonitorModule.IsRunning)
+            {
+                _systemMonitorModule.Start();
+            }
+            else
+            {
+                _systemMonitorModule.Tick();
+            }
+        }
+        else
+        {
+            _isDebugViewLocked = false;
+            _isDebugDraggable = false;
+            _debugWindow?.Hide();
+            CompositionTarget.Rendering -= CompositionTarget_Rendering_DebugFps;
+
+            GpuMonitorService.Instance.Stop();
+
+            if (!IsSystemMonitorWidgetMode && _systemMonitorModule.IsRunning)
+            {
+                _systemMonitorModule.Stop();
+            }
+        }
+
+        _collapsedWidth = GetCollapsedWidth();
+    }
+
+    private bool _isDebugViewLocked = false;
+    private bool _isDebugDraggable = false;
+
+    internal void SetDebugViewLock(bool lockState)
+    {
+        _isDebugViewLocked = lockState;
+    }
+
+    internal void SetDebugDraggable(bool draggable)
+    {
+        _isDebugDraggable = draggable;
+    }
+
+    internal void SetDebugViewState(string viewState)
+    {
+        switch (viewState)
+        {
+            case "MediaExpanded":
+                if (!_isExpanded) ExpandNotch();
+                if (_isSecondaryView) SwitchToPrimaryView();
+                break;
+            case "SecondaryShelf": // Existing debug automation alias.
+            case "SecondaryClipboard":
+                if (!_isExpanded) ExpandNotch();
+                SwitchToSecondaryView();
+                break;
+            case "TimerStopwatch":
+                if (!_isExpanded) ExpandNotch();
+                SwitchToTimerView();
+                break;
+            case "AudioRouting":
+                if (!_isExpanded) ExpandNotch();
+                SwitchToAudioView();
+                break;
+            case "CompactMusicPill":
+                bool prevLock = _isDebugViewLocked;
+                _isDebugViewLocked = false;
+                CollapseAll();
+                _isDebugViewLocked = prevLock;
+                _isMusicCompactMode = true;
+                _collapsedWidth = GetCollapsedWidth();
+                UpdateProgressSectionLayout();
+                break;
+            case "CollapsedNotch":
+                bool wasLock = _isDebugViewLocked;
+                _isDebugViewLocked = false;
+                CollapseAll();
+                _isDebugViewLocked = wasLock;
+                break;
+            default:
+                break;
+        }
+    }
+
+    internal void ResetNotchPosition()
+    {
+        _overlayWindow.ResetToCenteredTop(_windowWidth, _windowHeight);
+        _fixedX = _shellState.FixedX;
+        _fixedY = _shellState.FixedY;
+        _liquidGlass?.SetLiveRegion(GetGlassCaptureRegion());
+    }
+
+    private void UpdateRefreshRate()
+    {
+        try
+        {
+            int? refreshHz = Win32Interop.GetDisplayRefreshHz(null);
+            if (refreshHz.HasValue)
+            {
+                _currentDisplayHz = refreshHz.Value;
+                _debugWindow?.UpdateRefreshRate(_currentDisplayHz);
+            }
+            else
+            {
+                _currentDisplayHz = 0;
+                _debugWindow?.UpdateRefreshRate(0);
+            }
+        }
+        catch
+        {
+            _currentDisplayHz = 0;
+            _debugWindow?.UpdateRefreshRate(0);
+        }
+    }
+
+    private int _fpsWindowFrameCount = 0;
+    private long _fpsWindowStartTicks = 0;
+    private double _currentMeasuredFrameTimeMs = 0;
+    private long _lastFrameTimestamp = 0;
+    private TimeSpan _lastRenderingTime = TimeSpan.MinValue;
+
+    private void CompositionTarget_Rendering_DebugFps(object? sender, EventArgs e)
+    {
+        if (IsDuplicateRenderingFrame(e))
+            return;
+
+        _fpsWindowFrameCount++;
+        long now = Stopwatch.GetTimestamp();
+
+        UpdateFrameTimeMetrics(now);
+        UpdateMeasuredFpsMetrics(now);
+        UpdateDisplayHzPeriodically(now);
+    }
+
+    private bool IsDuplicateRenderingFrame(EventArgs e)
+    {
+        if (e is RenderingEventArgs rea)
+        {
+            if (rea.RenderingTime == _lastRenderingTime)
+            {
+                // Discard duplicate callbacks pumped by modal mouse-drag loops (e.g. moving DebugWindow) within the same VSync frame
+                return true;
+            }
+            _lastRenderingTime = rea.RenderingTime;
+        }
+        return false;
+    }
+
+    private void UpdateFrameTimeMetrics(long now)
+    {
+        if (_lastFrameTimestamp > 0)
+        {
+            double ft = (double)(now - _lastFrameTimestamp) / Stopwatch.Frequency * 1000.0;
+            // Only count active animation frames (ft <= 100ms).
+            // Intervals > 100ms are WPF retained-mode idle intervals (DWM pauses), not slow frames.
+            if (ft <= 100.0)
+            {
+                _currentMeasuredFrameTimeMs = _currentMeasuredFrameTimeMs == 0 ? ft : (_currentMeasuredFrameTimeMs * 0.8 + ft * 0.2);
+            }
+        }
+        _lastFrameTimestamp = now;
+    }
+
+    private void UpdateMeasuredFpsMetrics(long now)
+    {
+        if (_fpsWindowStartTicks == 0)
+        {
+            _fpsWindowStartTicks = now;
+            return;
+        }
+
+        double elapsedSec = (double)(now - _fpsWindowStartTicks) / Stopwatch.Frequency;
+        if (elapsedSec >= 0.4) // Refresh FPS count every 400ms for stable, accurate readings
+        {
+            double calculatedFps = _fpsWindowFrameCount / elapsedSec;
+            _currentMeasuredFps = Math.Round(calculatedFps);
+            _fpsWindowFrameCount = 0;
+            _fpsWindowStartTicks = now;
+        }
+    }
+
+    private void UpdateDisplayHzPeriodically(long now)
+    {
+        if ((now - _lastFpsUpdate) / Stopwatch.Frequency >= 1.0)
+        {
+            UpdateRefreshRate();
+            _lastFpsUpdate = now;
+        }
+    }
+}

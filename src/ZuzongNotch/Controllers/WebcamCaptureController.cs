@@ -1,0 +1,566 @@
+using System;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.InteropServices.WindowsRuntime;
+using System.Threading;
+using System.Threading.Tasks;
+using VNotch.Services;
+using Windows.Graphics.Imaging;
+using Windows.Media;
+using Windows.Media.Capture;
+using Windows.Media.Capture.Frames;
+using Windows.Media.MediaProperties;
+
+namespace VNotch.Controllers;
+
+public sealed class WebcamCaptureController : IDisposable
+{
+    private readonly object _lifecycleLock = new();
+
+    private MediaCapture? _mediaCapture;
+    private MediaFrameReader? _frameReader;
+    private MediaCapture? _initializingMediaCapture;
+
+    private bool _isActive;
+    private bool _starting;
+    private bool _stopping;
+
+    private int _fadeToken;
+    private static readonly object _teardownLock = new();
+    private static Task _teardownTask = Task.CompletedTask;
+
+    private long _lastFrameTimestamp;
+    private static readonly long FrameIntervalTicks = Stopwatch.Frequency / 30;
+
+    // Pinned so the GC never moves it; never shrunk once allocated to avoid LOH churn
+    // during the brief resolution-negotiation phase at camera startup.
+    private byte[] _frameBuffer = Array.Empty<byte>();
+    private int _frameBufferCapacity;
+    private byte[] _conversionBuffer = Array.Empty<byte>();
+    private int _frameBufferInUse;
+    public bool IsActive
+    {
+        get
+        {
+            lock (_lifecycleLock)
+                return _isActive;
+        }
+    }
+
+    public bool IsStarting
+    {
+        get
+        {
+            lock (_lifecycleLock)
+                return _starting;
+        }
+    }
+
+    public bool IsStopping
+    {
+        get
+        {
+            lock (_lifecycleLock)
+                return _stopping;
+        }
+    }
+
+    public bool HasReader
+    {
+        get
+        {
+            lock (_lifecycleLock)
+                return _frameReader != null;
+        }
+    }
+
+    public int FadeToken
+    {
+        get
+        {
+            lock (_lifecycleLock)
+                return _fadeToken;
+        }
+    }
+
+    public bool IsLifecycleActive
+    {
+        get
+        {
+            lock (_lifecycleLock)
+            {
+                return _isActive
+                    || _starting
+                    || _stopping
+                    || _frameReader != null
+                    || _mediaCapture != null
+                    || _initializingMediaCapture != null;
+            }
+        }
+    }
+
+    // The leased array may have headroom; only width * height * 4 bytes contain frame pixels.
+    public event Action<byte[], int, int, int>? FrameAvailable;
+
+    public void ReleaseFrameBuffer()
+    {
+        Volatile.Write(ref _frameBufferInUse, 0);
+    }
+
+    public int NextFadeToken()
+    {
+        lock (_lifecycleLock)
+            return ++_fadeToken;
+    }
+
+#pragma warning disable S3776 // Asynchronous UWP MediaCapture pipeline initialization involves multi-stage validation and cancellation checks
+    public async Task<string?> StartAsync(string? deviceId, Func<bool> isContextValid)
+    {
+
+        int fadeToken;
+        lock (_lifecycleLock)
+        {
+            if (_isActive && _frameReader != null) return null;
+            if (_starting || _stopping) return null;
+
+            _starting = true;
+            _isActive = true;
+            _lastFrameTimestamp = 0;
+
+            fadeToken = ++_fadeToken;
+        }
+
+        bool StillValid()
+        {
+            lock (_lifecycleLock)
+            {
+                if (fadeToken != _fadeToken || !_isActive)
+                    return false;
+            }
+
+            return isContextValid();
+        }
+
+        try
+        {
+            var (mediaCapture, frameReader, errorMsg) = await Task.Run(async () =>
+            {
+                MediaCapture? capture = null;
+                try
+                {
+                    Task priorTeardown;
+                    lock (_teardownLock)
+                        priorTeardown = _teardownTask;
+                    await priorTeardown.ConfigureAwait(false);
+                    if (!StillValid())
+                        return ((MediaCapture?)null, (MediaFrameReader?)null, (string?)null);
+
+                    var groups = await MediaFrameSourceGroup.FindAllAsync();
+                    MediaFrameSourceGroup? group = null;
+
+                    if (!string.IsNullOrEmpty(deviceId))
+                    {
+                        group = groups.FirstOrDefault(g => g.Id == deviceId &&
+                            g.SourceInfos.Any(s => s.SourceKind == MediaFrameSourceKind.Color));
+                    }
+
+                    group ??= groups.FirstOrDefault(g =>
+                        g.SourceInfos.Any(s => s.SourceKind == MediaFrameSourceKind.Color));
+
+                    if (group == null)
+                        return ((MediaCapture?)null, (MediaFrameReader?)null, "Cannot detect camera device");
+
+                    capture = new MediaCapture();
+                    bool ownsStart;
+                    lock (_lifecycleLock)
+                    {
+                        ownsStart = fadeToken == _fadeToken && _isActive;
+                        if (ownsStart)
+                        {
+                            _initializingMediaCapture = capture;
+                        }
+                    }
+                    if (!ownsStart)
+                    {
+                        capture.Dispose();
+                        return ((MediaCapture?)null, (MediaFrameReader?)null, (string?)null);
+                    }
+
+                    var initSettings = new MediaCaptureInitializationSettings
+                    {
+                        SourceGroup = group,
+                        MemoryPreference = MediaCaptureMemoryPreference.Cpu,
+                        StreamingCaptureMode = StreamingCaptureMode.Video
+                    };
+
+                    await capture.InitializeAsync(initSettings);
+                    if (!StillValid())
+                    {
+                        lock (_lifecycleLock)
+                        {
+                            if (ReferenceEquals(_initializingMediaCapture, capture))
+                            {
+                                _initializingMediaCapture = null;
+                            }
+                        }
+                        capture.Dispose();
+                        return ((MediaCapture?)null, (MediaFrameReader?)null, (string?)null);
+                    }
+
+                    var colorSource = capture.FrameSources.Values.FirstOrDefault(s => s.Info.SourceKind == MediaFrameSourceKind.Color);
+                    if (colorSource == null)
+                    {
+                        lock (_lifecycleLock)
+                        {
+                            if (ReferenceEquals(_initializingMediaCapture, capture))
+                            {
+                                _initializingMediaCapture = null;
+                            }
+                        }
+                        capture.Dispose();
+                        return ((MediaCapture?)null, (MediaFrameReader?)null, "Cannot detect color source");
+                    }
+
+                    const uint MaxPreviewWidth = 640;
+                    const uint MaxPreviewHeight = 480;
+
+                    MediaFrameReader reader;
+                    try
+                    {
+                        var currentFormat = colorSource.CurrentFormat?.VideoFormat;
+                        if (currentFormat != null && (currentFormat.Width > MaxPreviewWidth || currentFormat.Height > MaxPreviewHeight))
+                        {
+                            double scale = Math.Min((double)MaxPreviewWidth / currentFormat.Width, (double)MaxPreviewHeight / currentFormat.Height);
+                            uint targetWidth = Math.Max(1, (uint)Math.Round(currentFormat.Width * scale));
+                            uint targetHeight = Math.Max(1, (uint)Math.Round(currentFormat.Height * scale));
+                            // Ensure even dimensions
+                            targetWidth = (targetWidth + 1) & ~1u;
+                            targetHeight = (targetHeight + 1) & ~1u;
+
+                            var targetSize = new BitmapSize { Width = targetWidth, Height = targetHeight };
+                            reader = await capture.CreateFrameReaderAsync(colorSource, MediaEncodingSubtypes.Bgra8, targetSize);
+                        }
+                        else
+                        {
+                            reader = await capture.CreateFrameReaderAsync(colorSource, MediaEncodingSubtypes.Bgra8);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        RuntimeLog.Warn("CAMERA", $"CreateFrameReaderAsync with preview size failed, falling back to default: {ex.Message}");
+                        reader = await capture.CreateFrameReaderAsync(colorSource, MediaEncodingSubtypes.Bgra8);
+                    }
+
+                    lock (_lifecycleLock)
+                    {
+                        if (ReferenceEquals(_initializingMediaCapture, capture))
+                        {
+                            _initializingMediaCapture = null;
+                        }
+                    }
+                    return (capture, reader, (string?)null);
+                }
+                catch (Exception ex)
+                {
+                    if (capture != null)
+                    {
+                        lock (_lifecycleLock)
+                        {
+                            if (ReferenceEquals(_initializingMediaCapture, capture))
+                            {
+                                _initializingMediaCapture = null;
+                            }
+                        }
+                        try
+                        {
+                            capture.Dispose();
+                        }
+                        catch (Exception)
+                        {
+                            // Ignore errors during capture disposal on initialization failure.
+                        }
+                    }
+                    return ((MediaCapture?)null, (MediaFrameReader?)null, ex.Message);
+                }
+            });
+
+            if (!StillValid())
+            {
+                await DisposeResourcesAsync(frameReader, mediaCapture);
+                return null;
+            }
+
+            if (mediaCapture == null || frameReader == null)
+            {
+                lock (_lifecycleLock)
+                {
+                    if (fadeToken == _fadeToken)
+                    {
+                        _isActive = false;
+                    }
+                }
+                return errorMsg ?? "Cannot detect camera device";
+            }
+
+            frameReader.FrameArrived += OnFrameArrived;
+            bool accepted;
+            lock (_lifecycleLock)
+            {
+                accepted = fadeToken == _fadeToken && _isActive;
+                if (accepted)
+                {
+                    _mediaCapture = mediaCapture;
+                    _frameReader = frameReader;
+                }
+            }
+            if (!accepted)
+            {
+                frameReader.FrameArrived -= OnFrameArrived;
+                await DisposeResourcesAsync(frameReader, mediaCapture);
+                return null;
+            }
+
+            await frameReader.StartAsync();
+
+            if (!StillValid())
+            {
+                frameReader.FrameArrived -= OnFrameArrived;
+                lock (_lifecycleLock)
+                {
+                    if (ReferenceEquals(_frameReader, frameReader))
+                    {
+                        _frameReader = null;
+                    }
+                    if (ReferenceEquals(_mediaCapture, mediaCapture))
+                    {
+                        _mediaCapture = null;
+                    }
+                }
+                await DisposeResourcesAsync(frameReader, mediaCapture);
+            }
+
+            return null;
+        }
+        finally
+        {
+            lock (_lifecycleLock)
+            {
+                // Stop followed by Start may already have handed lifecycle
+                // ownership to a newer operation.
+                if (fadeToken == _fadeToken)
+                {
+                    _starting = false;
+                }
+            }
+        }
+    }
+#pragma warning restore S3776
+
+    public (MediaFrameReader? reader, MediaCapture? capture, MediaCapture? initializing) DetachForSafeStop()
+    {
+        MediaFrameReader? reader;
+        MediaCapture? capture;
+        MediaCapture? initializingCapture;
+        lock (_lifecycleLock)
+        {
+            _isActive = false;
+            _starting = false;
+            _stopping = false;
+            _fadeToken++;
+
+            initializingCapture = _initializingMediaCapture;
+            _initializingMediaCapture = null;
+            reader = _frameReader;
+            capture = _mediaCapture;
+            _frameReader = null;
+            _mediaCapture = null;
+        }
+
+        if (reader != null)
+        {
+            reader.FrameArrived -= OnFrameArrived;
+        }
+
+        return (reader, capture, initializingCapture);
+    }
+
+    public bool TryBeginGracefulStop(out int fadeToken, out MediaFrameReader? reader, out MediaCapture? capture)
+    {
+        reader = null;
+        capture = null;
+
+        lock (_lifecycleLock)
+        {
+            fadeToken = _fadeToken;
+            if (_stopping) return false;
+
+            _stopping = true;
+            _starting = false;
+            _isActive = false;
+            fadeToken = ++_fadeToken;
+
+            reader = _frameReader;
+            capture = _mediaCapture;
+            _frameReader = null;
+            _mediaCapture = null;
+        }
+
+        if (reader != null)
+        {
+            reader.FrameArrived -= OnFrameArrived;
+        }
+
+        return true;
+    }
+
+    public void EndGracefulStop(int fadeToken)
+    {
+        lock (_lifecycleLock)
+        {
+            if (fadeToken == _fadeToken)
+            {
+                _stopping = false;
+            }
+        }
+    }
+
+    public static Task DisposeResourcesAsync(MediaFrameReader? reader, MediaCapture? capture)
+    {
+        if (reader == null && capture == null) return Task.CompletedTask;
+        Task prior;
+        lock (_teardownLock)
+            prior = _teardownTask = RunTeardownAsync(_teardownTask, reader, capture);
+        return prior;
+    }
+
+    private static async Task RunTeardownAsync(Task prior, MediaFrameReader? reader, MediaCapture? capture)
+    {
+        await prior.ConfigureAwait(false);
+        await Task.Run(async () =>
+        {
+            if (reader != null)
+            {
+                try
+                {
+                    await reader.StopAsync();
+                }
+                catch (Exception)
+                {
+                    // FrameReader may already be stopped or in faulted state during teardown.
+                }
+
+                try
+                {
+                    reader.Dispose();
+                }
+                catch (Exception)
+                {
+                    // FrameReader disposal errors during teardown are safely ignored.
+                }
+            }
+
+            try
+            {
+                capture?.Dispose();
+            }
+            catch (Exception)
+            {
+                // MediaCapture disposal errors during teardown are safely ignored.
+            }
+        });
+    }
+
+    private void OnFrameArrived(MediaFrameReader sender, MediaFrameArrivedEventArgs args)
+    {
+        int frameToken;
+        lock (_lifecycleLock)
+        {
+            if (!_isActive || !ReferenceEquals(sender, _frameReader))
+                return;
+
+            frameToken = _fadeToken;
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        if (now - _lastFrameTimestamp < FrameIntervalTicks)
+            return;
+
+        if (Volatile.Read(ref _frameBufferInUse) != 0) return;
+        using var frame = sender.TryAcquireLatestFrame();
+        if (frame?.VideoMediaFrame?.SoftwareBitmap == null) return;
+        ProcessFrame(frame.VideoMediaFrame.SoftwareBitmap, frameToken);
+    }
+
+    internal void ProcessFrame(SoftwareBitmap softwareBitmap, int frameToken)
+    {
+        lock (_lifecycleLock)
+        {
+            if (!_isActive || frameToken != _fadeToken) return;
+        }
+        long now = Stopwatch.GetTimestamp();
+        if (now - _lastFrameTimestamp < FrameIntervalTicks) return;
+
+        // Keep at most one copied frame in flight. The UI consumes this buffer
+        // asynchronously, so it must release the lease before capture can reuse it.
+        if (Interlocked.CompareExchange(ref _frameBufferInUse, 1, 0) != 0)
+        {
+            return;
+        }
+        _lastFrameTimestamp = now;
+
+        bool handedOff = false;
+        try
+        {
+            int width = softwareBitmap.PixelWidth;
+            int height = softwareBitmap.PixelHeight;
+            int requiredSize = checked(width * height * 4);
+
+            if (requiredSize > _frameBufferCapacity)
+            {
+                // Always grow by at least 25% headroom so successive slight resolution
+                // increases (e.g. auto-focus crop changes) don't trigger repeated LOH allocs.
+                int newCapacity = Math.Max(requiredSize, requiredSize + requiredSize / 4);
+                _frameBuffer = GC.AllocateUninitializedArray<byte>(newCapacity, pinned: true);
+                _frameBufferCapacity = newCapacity;
+            }
+
+            if (softwareBitmap.BitmapPixelFormat == BitmapPixelFormat.Bgra8 &&
+                softwareBitmap.BitmapAlphaMode == BitmapAlphaMode.Premultiplied)
+                softwareBitmap.CopyToBuffer(_frameBuffer.AsBuffer(0, requiredSize));
+            else
+                WebcamPixelConverter.CopyToBgra8(softwareBitmap, _frameBuffer, requiredSize, ref _conversionBuffer);
+
+            var handler = FrameAvailable;
+            if (handler == null) return;
+
+            lock (_lifecycleLock)
+            {
+                if (!_isActive ||
+                    frameToken != _fadeToken)
+                {
+                    return;
+                }
+            }
+
+            handler(_frameBuffer, width, height, frameToken);
+            handedOff = true;
+        }
+        finally
+        {
+            if (!handedOff)
+            {
+                ReleaseFrameBuffer();
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        var (reader, capture, initializing) = DetachForSafeStop();
+        _ = DisposeResourcesAsync(reader, capture);
+        if (initializing != null && !ReferenceEquals(initializing, capture))
+        {
+            _ = DisposeResourcesAsync(null, initializing);
+        }
+    }
+}

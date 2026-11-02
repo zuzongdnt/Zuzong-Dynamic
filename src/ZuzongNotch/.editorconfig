@@ -1,0 +1,33 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+
+[*.{cs,csx}]
+dotnet_sort_system_directives_first = true
+dotnet_separate_import_directive_groups = false
+csharp_new_line_before_open_brace = all
+csharp_indent_case_contents = true
+
+[*.{xml,xaml,csproj,props,targets,nuspec}]
+indent_size = 2
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.{md,svg}]
+trim_trailing_whitespace = false
+
+# Architectural rules aligned with C++26 Native-First & Zero-LINQ guidelines
+[*.cs]
+dotnet_diagnostic.S6640.severity = none
+dotnet_diagnostic.S3267.severity = none
+dotnet_diagnostic.S4200.severity = none
+
+[Tests/**/*.cs]
+dotnet_diagnostic.CA1707.severity = none

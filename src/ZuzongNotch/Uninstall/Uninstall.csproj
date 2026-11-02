@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
+
+    <AssemblyName>uninstall</AssemblyName>
+    <RootNamespace>VNotch.Uninstaller</RootNamespace>
+
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile Condition="'$(Configuration)' == 'Release' And '$(SelfContained)' == 'true'">true</EnableCompressionInSingleFile>
+    <PublishReferencesDocumentationFiles>false</PublishReferencesDocumentationFiles>
+    <SelfContained>false</SelfContained>
+
+    <Authors>w0otdev</Authors>
+    <Company>V-Notch</Company>
+    <Product>V-Notch Uninstaller</Product>
+    <Copyright>Copyright © 2026 w0otdev</Copyright>
+    <Description>Completely removes V-Notch and all of its data from this computer.</Description>
+    <ApplicationIcon>..\Services\icons\logo.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Services\LocalizationService.cs" Link="Services\LocalizationService.cs" />
+    <Compile Include="..\Services\InstallDirectoryCleanup.cs" Link="Services\InstallDirectoryCleanup.cs" />
+    <Compile Include="..\Services\SafeFileDeletion.cs" Link="Services\SafeFileDeletion.cs" />
+    <Compile Include="..\Services\AppProcessShutdown.cs" Link="Services\AppProcessShutdown.cs" />
+    <Compile Include="..\Services\SetupDialogs.cs" Link="Services\SetupDialogs.cs" />
+    <EmbeddedResource Include="..\Locales\*.json" LogicalName="VNotch.Locales.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

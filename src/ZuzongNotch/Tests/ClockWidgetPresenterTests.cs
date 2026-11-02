@@ -1,0 +1,284 @@
+using System;
+using System.Threading;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Threading;
+using VNotch.Models;
+using VNotch.Presenters;
+using Xunit;
+
+namespace VNotch.Tests;
+
+public sealed class ClockWidgetPresenterTests
+{
+    private sealed class FakeClockHost : IClockWidgetHost
+    {
+        public NotchSettings Settings { get; set; } = new();
+        public void SaveSettings() { }
+
+        public bool IsAnimating { get; set; }
+        public bool IsSecondaryView { get; set; }
+        public bool IsExpanded { get; set; } = true;
+        public bool IsTimerView { get; set; }
+        public bool IsLyricsActive { get; set; }
+        public int TransitionGeneration { get; set; } = 1;
+
+        public Brush TransparentBrush => Brushes.Transparent;
+        public Brush WhiteBrush => Brushes.White;
+
+        public void SwitchToTimerView() { }
+        public int CollapsedCount { get; private set; }
+        public int OpenedWeatherSettingsCount { get; private set; }
+        public void CollapseNotch() => CollapsedCount++;
+        public void OpenWeatherSettings() => OpenedWeatherSettingsCount++;
+
+        public IntPtr Hwnd => IntPtr.Zero;
+        public int FixedX => 0;
+        public int FixedY => 0;
+        public int WindowWidth => 600;
+        public int WindowHeight { get; set; } = 300;
+        public double ExpandedHeight => 240;
+        public double MaxExpandedHeight => 378;
+
+        public Window Window { get; set; } = null!;
+    }
+
+    [Fact]
+    public void ApplyExpandedWidgetMode_DigitalClock_ShowsGreetingSectionWithCenteredText()
+    {
+        RunSta(() =>
+        {
+            var host = new FakeClockHost();
+            host.Settings.ExpandedWidget = "digitalclock";
+            host.IsLyricsActive = false;
+
+            var window = new Window();
+            host.Window = window;
+
+            var clockWidget = new Grid();
+            var digitalClockWidget = new Grid();
+            var calendarStrip = new Grid();
+            var greetingSection = new Grid { Opacity = 0 };
+            var eventText = new TextBlock();
+            var notchBorder = new Border();
+
+            var refs = new ClockWidgetViewRefs
+            {
+                ClockWidget = clockWidget,
+                DigitalClockWidget = digitalClockWidget,
+                CalendarStripContainer = calendarStrip,
+                GreetingSection = greetingSection,
+                EventText = eventText,
+                CalendarWidget = new Border(),
+                NotchBorder = notchBorder,
+                Window = window
+            };
+
+            using var presenter = new ClockWidgetPresenter(host, refs);
+            presenter.ApplyExpandedWidgetMode();
+
+            Assert.Equal(Visibility.Visible, digitalClockWidget.Visibility);
+            Assert.Equal(Visibility.Collapsed, clockWidget.Visibility);
+            Assert.Equal(Visibility.Collapsed, calendarStrip.Visibility);
+            Assert.Equal(Visibility.Visible, greetingSection.Visibility);
+            Assert.Equal(1.0, greetingSection.Opacity);
+            Assert.Equal(HorizontalAlignment.Center, eventText.HorizontalAlignment);
+        });
+    }
+
+    [Fact]
+    public void ApplyExpandedWidgetMode_DigitalClock_SuppressesGreetingWhenLyricsActive()
+    {
+        RunSta(() =>
+        {
+            var host = new FakeClockHost();
+            host.Settings.ExpandedWidget = "digitalclock";
+            host.IsLyricsActive = true;
+
+            var window = new Window();
+            host.Window = window;
+
+            var greetingSection = new Grid();
+            var refs = new ClockWidgetViewRefs
+            {
+                ClockWidget = new Grid(),
+                DigitalClockWidget = new Grid(),
+                CalendarStripContainer = new Grid(),
+                GreetingSection = greetingSection,
+                CalendarWidget = new Border(),
+                NotchBorder = new Border(),
+                Window = window
+            };
+
+            using var presenter = new ClockWidgetPresenter(host, refs);
+            presenter.ApplyExpandedWidgetMode();
+
+            Assert.Equal(Visibility.Collapsed, greetingSection.Visibility);
+        });
+    }
+
+    [Fact]
+    public void ApplyExpandedWidgetMode_Calendar_ShowsGreetingSection()
+    {
+        RunSta(() =>
+        {
+            var host = new FakeClockHost();
+            host.Settings.ExpandedWidget = "calendar";
+            host.IsLyricsActive = false;
+
+            var window = new Window();
+            host.Window = window;
+
+            var greetingSection = new Grid();
+            var eventText = new TextBlock();
+            var refs = new ClockWidgetViewRefs
+            {
+                ClockWidget = new Grid(),
+                CalendarStripContainer = new Grid(),
+                GreetingSection = greetingSection,
+                EventText = eventText,
+                CalendarWidget = new Border(),
+                NotchBorder = new Border(),
+                Window = window
+            };
+
+            using var presenter = new ClockWidgetPresenter(host, refs);
+            presenter.ApplyExpandedWidgetMode();
+
+            Assert.Equal(Visibility.Visible, greetingSection.Visibility);
+            Assert.Equal(HorizontalAlignment.Left, eventText.HorizontalAlignment);
+        });
+    }
+
+    [Theory]
+    [InlineData("clock")]
+    [InlineData("wordclock")]
+    [InlineData("weather")]
+    [InlineData("sysmon")]
+    public void ApplyExpandedWidgetMode_NonGreetingWidgets_HideGreetingSection(string widgetMode)
+    {
+        RunSta(() =>
+        {
+            var host = new FakeClockHost();
+            host.Settings.ExpandedWidget = widgetMode;
+            host.IsLyricsActive = false;
+
+            var window = new Window();
+            host.Window = window;
+
+            var greetingSection = new Grid();
+            var refs = new ClockWidgetViewRefs
+            {
+                ClockWidget = new Grid(),
+                WordClockWidget = new Grid(),
+                WeatherWidgetContent = new Grid(),
+                SystemMonitorWidgetContent = new Grid(),
+                CalendarStripContainer = new Grid(),
+                GreetingSection = greetingSection,
+                CalendarWidget = new Border(),
+                NotchBorder = new Border(),
+                Window = window
+            };
+
+            using var presenter = new ClockWidgetPresenter(host, refs);
+            presenter.ApplyExpandedWidgetMode();
+
+            Assert.Equal(Visibility.Collapsed, greetingSection.Visibility);
+        });
+    }
+
+    [Fact]
+    public void ResizeHostWindowHeight_DoesNotResizeWindow_WhenAlreadySatisfiesMaxExpandedHeight()
+    {
+        RunSta(() =>
+        {
+            var host = new FakeClockHost();
+            var window = new Window { Height = 458 };
+            host.Window = window;
+            double dpiScale = VisualTreeHelper.GetDpi(window).DpiScaleX;
+            if (dpiScale <= 0) dpiScale = 1.0;
+            int expectedPixelHeight = (int)Math.Round(458 * dpiScale);
+            host.WindowHeight = expectedPixelHeight;
+
+            var refs = new ClockWidgetViewRefs
+            {
+                ClockWidget = new Grid(),
+                CalendarStripContainer = new Grid(),
+                CalendarWidget = new Border(),
+                NotchBorder = new Border(),
+                Window = window
+            };
+
+            using var presenter = new ClockWidgetPresenter(host, refs);
+
+            // Simulating switching from Camera view (328) to Media view (150)
+            presenter.ResizeHostWindowHeight(150);
+            Assert.Equal(458, window.Height);
+            Assert.Equal(expectedPixelHeight, host.WindowHeight);
+
+            // Simulating switching to Secondary / ClipboardTray view (268)
+            presenter.ResizeHostWindowHeight(268);
+            Assert.Equal(458, window.Height);
+            Assert.Equal(expectedPixelHeight, host.WindowHeight);
+        });
+    }
+
+    [Theory]
+    [InlineData(false, 1, 0)]
+    [InlineData(true, 0, 1)]
+    public void TapOnWeatherWidget_OpensWeatherSettingsWhenDisabled_OrCollapsesWhenEnabled(bool enableWeather, int expectedSettingsOpens, int expectedCollapses)
+    {
+        RunSta(() =>
+        {
+            var host = new FakeClockHost();
+            host.Settings.ExpandedWidget = "weather";
+            host.Settings.EnableWeather = enableWeather;
+            host.Settings.EnableLocalOnlyMode = false;
+            host.Settings.AllowOnlineWeather = true;
+
+            var window = new Window();
+            host.Window = window;
+            var calendarWidget = new Border();
+            var refs = new ClockWidgetViewRefs
+            {
+                ClockWidget = new Grid(),
+                CalendarStripContainer = new Grid(),
+                CalendarWidget = calendarWidget,
+                NotchBorder = new Border(),
+                Window = window
+            };
+
+            using var presenter = new ClockWidgetPresenter(host, refs);
+            var down = new System.Windows.Input.MouseButtonEventArgs(System.Windows.Input.Mouse.PrimaryDevice, 0, System.Windows.Input.MouseButton.Left)
+            {
+                RoutedEvent = UIElement.MouseLeftButtonDownEvent
+            };
+            var up = new System.Windows.Input.MouseButtonEventArgs(System.Windows.Input.Mouse.PrimaryDevice, 1, System.Windows.Input.MouseButton.Left)
+            {
+                RoutedEvent = UIElement.MouseLeftButtonUpEvent
+            };
+
+            presenter.OnCalendarWidgetMouseLeftButtonDown(down);
+            presenter.OnCalendarWidgetMouseLeftButtonUp(up);
+
+            Assert.Equal(expectedSettingsOpens, host.OpenedWeatherSettingsCount);
+            Assert.Equal(expectedCollapses, host.CollapsedCount);
+        });
+    }
+
+    private static void RunSta(Action action)
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try { VNotch.TestSupport.BackgroundTestDesktop.AttachCurrentThread(); action(); }
+            catch (Exception ex) { failure = ex; }
+            finally { Dispatcher.CurrentDispatcher.InvokeShutdown(); }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join(TimeSpan.FromSeconds(15));
+        if (failure != null) throw failure;
+    }
+}

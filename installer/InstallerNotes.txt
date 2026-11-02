@@ -1,0 +1,13 @@
+ZUZONG DYNAMIC
+
+Notch độc lập dành cho Windows 10 (bản 2004 trở lên) / Windows 11, máy x64.
+
+Bộ cài đã kèm .NET Desktop Runtime. Không cần cài Windhawk, V-Notch gốc hoặc Taskbar Glass.
+
+App được cài cho tài khoản Windows hiện tại. Bạn có thể chọn tạo shortcut Desktop và tự chạy khi đăng nhập Windows.
+
+Trước khi cập nhật hoặc gỡ cài đặt, hãy thoát Zuzong Dynamic từ biểu tượng ở khay hệ thống. Bộ cài không tự tắt ứng dụng đang chạy.
+
+Cấu hình được lưu riêng trong %LOCALAPPDATA%\ZuzongDynamic và được giữ lại khi gỡ cài đặt. Bộ cài không chứa API key, phiên đăng nhập Spotify hoặc cấu hình cá nhân của người tạo.
+
+Phát triển từ V-Notch của w0otdev, theo giấy phép Apache 2.0. Giữ đầy đủ ghi nhận nguồn gốc và giấy phép đi kèm.

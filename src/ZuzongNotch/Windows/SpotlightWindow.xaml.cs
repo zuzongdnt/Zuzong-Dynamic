@@ -1,0 +1,3325 @@
+using System.Runtime.InteropServices;
+using System.ComponentModel;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
+using System.Windows.Threading;
+using VNotch.Models;
+using VNotch.Services;
+using VNotch.Services.Spotlight;
+using VNotch.ViewModels;
+using static VNotch.Services.Win32Interop;
+
+namespace VNotch;
+
+public partial class SpotlightWindow : Window
+{
+    public static Brush ChatIconBrush => UiPalette.PrimaryBrush;
+    public static Brush ChatActiveIconBrush => UiPalette.PrimaryBrush;
+
+    private const double ExpandedCornerRadius = 14;
+    private const double NotchShadowBlurRadius = 20;
+    private const double NotchShadowDepth = 4;
+    private const int PageJump = 4;
+    private const double StaleResultsOpacity = 0.55;
+    private static readonly TimeSpan MorphDuration = TimeSpan.FromMilliseconds(560);
+    private static readonly TimeSpan SearchingPanelGrace = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan QueryRestoreWindow = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan FailureDisplayTime = TimeSpan.FromMilliseconds(2800);
+    private readonly SpotlightViewModel _viewModel;
+    private readonly SpotlightLauncher _launcher;
+    private bool _allowClose;
+    private bool _isClosing;
+    private int _animationGeneration;
+    private bool _launchInFlight;
+    private string? _pendingLaunchQuery;
+    private string? _lastDismissedQuery;
+    private DateTime _lastDismissedAtUtc;
+    private UiScheduledTimer? _searchingGraceTimer;
+    private int _searchingGraceGeneration;
+    private bool _searchingPanelArmed;
+    private UiScheduledTimer? _failureTimer;
+    private int _failureGeneration;
+    private static readonly TimeSpan ShakeCooldown = TimeSpan.FromMilliseconds(350);
+    private DateTime _lastShakeAtUtc = DateTime.MinValue;
+    private int _shakeGeneration;
+    private int _launchGeneration;
+    private bool _resultsDimmed;
+    private bool _escBadgeVisible = true;
+    private System.Windows.Controls.Border? _selectionGlide;
+    private TranslateTransform? _glideTransform;
+    private bool _glideVisible;
+    private bool _glideUpdateQueued;
+    private bool _contentShown;
+    private int _contentSizeGeneration;
+    private bool _contentResizeQueued;
+    private bool _searchHeightHeld;
+    private double _contentHeightTarget = double.NaN;
+    private long _contentHeightAnimationVersion;
+    private bool _statusRefreshQueued;
+    private bool _entranceActive;
+    private bool _pendingContentReveal;
+    private bool _entranceContentReserved;
+    private SolidColorBrush? _shellBorderBrush;
+    private DispatcherOperation? _freshEntranceOperation;
+    private HwndSource? _hwndSource;
+    private IntPtr _hwnd = IntPtr.Zero;
+    private bool _isParked;
+    private double _unparkedWindowOpacity = 1;
+
+    private IntPtr EnsureHwnd()
+    {
+        if (_hwnd != IntPtr.Zero) return _hwnd;
+        try
+        {
+            _hwnd = new WindowInteropHelper(this).EnsureHandle();
+        }
+        catch (Exception ex)
+        {
+            // Handle creation may fail if called before initialization or during window destruction.
+            System.Diagnostics.Debug.WriteLine($"[Spotlight] EnsureHandle failed: {ex.Message}");
+        }
+        return _hwnd;
+    }
+
+    private bool _unparkedWindowHitTesting = true;
+    private bool _unparkedWindowFocusable = true;
+    private IntPtr _previousForegroundWindow;
+    private CancellationTokenSource? _searchDebounceCts;
+    private Uri? _spotlightClickUri;
+    internal ISpotlightMorphHost? MorphHostOverride { get; set; }
+    internal bool SuppressForegroundActivationForTests { get; set; }
+    internal bool IsSpotlightOpen => IsVisible && !_isParked;
+    internal event EventHandler? OpenStateChanged;
+
+    internal SpotlightWindow(SpotlightViewModel viewModel, SpotlightLauncher launcher, NotchSettings? settings = null,
+        SpotlightAiService? aiService = null, SpotlightChatStore? chatStore = null)
+    {
+        _aiService = aiService ?? new SpotlightAiService();
+        _chatStore = chatStore ?? new SpotlightChatStore();
+        InitializeComponent();
+        LocalizedPresentation.Apply(this);
+        if (settings != null) _settings = settings.Clone();
+        _viewModel = viewModel;
+        _viewModel.HistoryEnabled = _settings.EnableSpotlightHistory;
+        _launcher = launcher;
+        DataContext = viewModel;
+        LoadAiHistory();
+        RefreshLocalization();
+        ApplyLiquidGlassSkin();
+        SyncSearchIconState(animate: false);
+        SearchActivity.IsVisibleChanged += (_, _) => RefreshSearchActivityMotion();
+        AnimationConfig.ReduceMotionChanged += OnSearchMotionPreferenceChanged;
+
+        // Activation from the global hotkey can land after ShowSpotlight has
+        Activated += (_, _) =>
+        {
+            if (!_isParked
+                && !_isClosing
+                && SearchBox.IsEnabled
+                && !SearchBox.IsKeyboardFocused)
+            {
+                SearchBox.Focus();
+                Keyboard.Focus(SearchBox);
+            }
+        };
+        IsVisibleChanged += (_, args) =>
+        {
+            // Last-resort ownership invariant: no hidden Spotlight HWND may
+            if (args.NewValue is false)
+            {
+                ReleaseMorphSession();
+            }
+        };
+
+        // The entrance morph publishes results while the shell is still at
+        ResultsList.SizeChanged += (_, _) => ScheduleGlideUpdate();
+
+        // Never measure the ListBox from inside ObservableCollection's
+        _viewModel.Results.CollectionChanged += (_, _) => ScheduleStatusRefresh();
+        _viewModel.ResultsPublished += (_, _) => OnResultsPublished();
+        _viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName is nameof(SpotlightViewModel.IsSearching)
+                or nameof(SpotlightViewModel.HasNoResults)
+                or nameof(SpotlightViewModel.IsWindowsSearchUnavailable))
+            {
+                if (args.PropertyName == nameof(SpotlightViewModel.IsSearching)
+                    && !_viewModel.IsSearching)
+                {
+                    SetResultsDimmed(false);
+                    // The search finished empty; a queued Enter must never fire, but shake to notify
+                    if (_viewModel.Results.Count == 0 && _pendingLaunchQuery != null)
+                    {
+                        _pendingLaunchQuery = null;
+                        PlayShake();
+                    }
+                }
+                RefreshStatus();
+            }
+        };
+    }
+
+    internal void RefreshLocalization()
+    {
+        Language = System.Windows.Markup.XmlLanguage.GetLanguage(Loc.GetCulture().IetfLanguageTag);
+        if (PlaceholderText != null)
+        {
+            PlaceholderText.Text = Loc.Get("spotlight.placeholder");
+        }
+        if (SearchBox != null)
+        {
+            SearchBox.SetValue(System.Windows.Automation.AutomationProperties.NameProperty, Loc.Get("spotlight.placeholder"));
+        }
+        LocalizeAi();
+        RefreshStatus();
+        if (IsSpotlightOpen && !_isClosing && SearchBox != null && !_aiMode)
+        {
+            _ = _viewModel.SearchAsync(SearchBox.Text);
+        }
+    }
+
+    private bool _preparingGlassEntrance;
+
+    internal void ShowSpotlight()
+    {
+        if (_isClosing) return;
+
+        // Dismissing the surface does not end its conversation or active stream.
+        bool reopenAi = _aiRequest != null || _settings.SpotlightDefaultAi;
+        bool modeChanged = _aiMode != reopenAi;
+        _aiMode = reopenAi;
+        if (modeChanged) _lastDismissedQuery = string.Empty;
+        AiPanel.Visibility = _aiMode ? Visibility.Visible : Visibility.Collapsed;
+        LocalizeAi();
+        UpdateAiAmbientGlow(_aiMode);
+        SearchBox.IsEnabled = true;
+        // The stream owns its live transcript control until it completes.
+        if (_aiMode && _aiRequest == null) RenderAiHistory();
+        SyncSearchIconState(animate: false);
+        _glassResourceExpiry?.Stop();
+        PlaySpotlightClickSfx();
+
+        _previousForegroundWindow = GetForegroundWindow();
+        int generation = ++_animationGeneration;
+        InvalidateLaunchAttempt();
+        ResetMorphVisuals();
+        // A restored query can publish instant results synchronously from the
+        _entranceActive = !AnimationConfig.ReduceMotion;
+        _viewModel.Reset();
+        _pendingLaunchQuery = null;
+        ClearLaunchFailure();
+        SetResultsDimmed(false, animate: false);
+
+        // An accidental dismissal (stray click, focus steal) should not cost
+        bool restoreQuery = !string.IsNullOrEmpty(_lastDismissedQuery)
+            && DateTime.UtcNow - _lastDismissedAtUtc < QueryRestoreWindow;
+        SearchBox.Text = restoreQuery ? _lastDismissedQuery : string.Empty;
+        if (restoreQuery) SearchBox.SelectAll();
+        else if (!_aiMode) _ = _viewModel.SearchAsync(string.Empty);
+
+        // Search mode may have left the results list/status visible. Re-sync
+        // the whole surface so AI mode never reopens showing stale search UI.
+        if (_aiMode) RefreshAiPanel();
+
+        _preparingGlassEntrance = true;
+        ApplyLiquidGlassSkin();
+        // On a cold cache, allocate before the animation clocks start instead
+        // of servicing a synchronous Send-priority request from the first capture.
+        _liquidGlass?.PrepareGpuResources();
+        _liquidGlass?.SetAnimating(true);
+
+        // Acquire the source view before Show(). WPF can deactivate MainWindow
+        SetMorphSessionActive(true);
+        try
+        {
+            RefreshLocalization();
+            if (_isParked) UnparkWindow();
+            else if (!IsVisible)
+            {
+                Show();
+                if (IsLiquidGlassEnabled && GlassBackdropHost.Visibility == Visibility.Visible)
+                {
+                    CompositionTarget.Rendering -= OnLiquidGlassFrameUpdate;
+                    CompositionTarget.Rendering += OnLiquidGlassFrameUpdate;
+                }
+            }
+            if (IsLiquidGlassEnabled && !_gpuRefractionConfigured)
+            {
+                ConfigureGpuRefraction();
+                ApplyLiquidGlassConfig();
+                _liquidGlass?.PrepareGpuResources();
+            }
+            IntPtr hwnd = EnsureHwnd();
+            // Reserve content against the same inner width used after the morph.
+            Shell.BorderThickness = new Thickness(IsLiquidGlassEnabled ? 0 : 1);
+            UpdateLayout();
+            FocusSearchBox(generation);
+            PrepareEntranceContentReservation();
+
+            var target = GetSpotlightTarget();
+            Action startEntrance = PrepareEntrance(
+                target.Left,
+                target.Top,
+                generation);
+            UpdateLayout();
+            _liquidGlass?.SetLiveRegion(GetGlassCaptureRegion());
+            _preparingGlassEntrance = false;
+            if (hwnd != IntPtr.Zero && IsLiquidGlassEnabled) _liquidGlass?.Start();
+            ScheduleFreshEntranceAfterComposition(
+                startEntrance,
+                generation);
+        }
+        catch
+        {
+            _preparingGlassEntrance = false;
+            CancelPendingFreshEntrance();
+            ReleaseMorphSession();
+            throw;
+        }
+    }
+
+    // The click sound is decoded, softened and played by VNotch.Native (Native/Services/SpotlightSfx.cpp).
+    [System.Runtime.InteropServices.LibraryImport("VNotch.Native.dll", StringMarshalling = System.Runtime.InteropServices.StringMarshalling.Utf16)]
+    private static partial int vn_spotlight_sfx_load(string path, int pathLength, out int hresult);
+
+    [System.Runtime.InteropServices.LibraryImport("VNotch.Native.dll")]
+    private static partial int vn_spotlight_sfx_play(float volume);
+
+    [System.Runtime.InteropServices.LibraryImport("VNotch.Native.dll")]
+    private static partial int vn_spotlight_sfx_stop();
+
+    [System.Runtime.InteropServices.LibraryImport("VNotch.Native.dll")]
+    private static partial int vn_spotlight_sfx_is_loaded(out byte loaded);
+
+    private bool _sfxCleanupHooked;
+    private long _lastSpotlightSfxTick;
+
+    private static void DisposeSpotlightSfxOutput() => vn_spotlight_sfx_stop();
+
+    private void EnsureSfxCleanupHooked()
+    {
+        if (_sfxCleanupHooked) return;
+        _sfxCleanupHooked = true;
+        Closed += (_, _) => DisposeSpotlightSfxOutput();
+    }
+
+    private void PlaySpotlightClickSfx()
+    {
+        if (SuppressForegroundActivationForTests || !_settings.EnableInteractionSounds || _settings.InteractionSoundVolume <= 0) return;
+        long now = Environment.TickCount64;
+        if (now - _lastSpotlightSfxTick < 220) return;
+        _lastSpotlightSfxTick = now;
+        try
+        {
+            EnsureSfxCleanupHooked();
+            if (vn_spotlight_sfx_is_loaded(out byte loaded) != 0 || loaded == 0)
+            {
+                static string FindSfx(string folder)
+                {
+                    string m4a = System.IO.Path.Combine(folder, "Assets", "SPL_CLICK_SFX.m4a");
+                    if (System.IO.File.Exists(m4a)) return m4a;
+                    string mp3 = System.IO.Path.Combine(folder, "Assets", "SPL_CLICK_SFX.mp3");
+                    return System.IO.File.Exists(mp3) ? mp3 : m4a;
+                }
+
+                string? dir = AppDomain.CurrentDomain.BaseDirectory;
+                for (int depth = 0; depth < 6 && !string.IsNullOrEmpty(dir); depth++)
+                {
+                    string candidate = FindSfx(dir);
+                    if (System.IO.File.Exists(candidate))
+                    {
+                        _spotlightClickUri = new Uri(candidate, UriKind.Absolute);
+                        break;
+                    }
+                    dir = System.IO.Directory.GetParent(dir)?.FullName;
+                }
+
+                if (_spotlightClickUri == null) return;
+                string path = _spotlightClickUri.LocalPath;
+                if (vn_spotlight_sfx_load(path, path.Length, out _) != 0) return;
+            }
+
+            vn_spotlight_sfx_play((float)Math.Clamp(_settings.InteractionSoundVolume * 1.35, 0.0, 1.0));
+        }
+        catch
+        {
+            // Ignore audio playback errors
+        }
+    }
+    private void ScheduleFreshEntranceAfterComposition(
+        Action startEntrance,
+        int generation)
+    {
+        CancelPendingFreshEntrance();
+        // Start on the next dispatcher turn; opening must not wait for a
+        // Magnifier frame or several composition pulses before becoming visible.
+        _freshEntranceOperation = Dispatcher.BeginInvoke(DispatcherPriority.Input, (Action)(() =>
+        {
+            _freshEntranceOperation = null;
+            if (generation != _animationGeneration || !IsSpotlightOpen || _isClosing) return;
+
+            if (IsLiquidGlassEnabled && _liquidGlass?.HasPresentedFrame != true)
+                Shell.Background = (Brush)FindResource("ShellBrush");
+
+            Opacity = 1;
+            startEntrance();
+            FocusSearchBox(generation);
+        }));
+    }
+
+    private bool CancelPendingFreshEntrance()
+    {
+        DispatcherOperation? operation = _freshEntranceOperation;
+        _freshEntranceOperation = null;
+        return operation?.Abort() == true;
+    }
+
+    private void FocusSearchBox(int generation)
+    {
+        if (SuppressForegroundActivationForTests) return;
+        ForceForeground();
+        SearchBox.Focus();
+        Keyboard.Focus(SearchBox);
+        if (SearchBox.IsKeyboardFocused) return;
+
+        // Windows can refuse the foreground switch while another process holds
+        Dispatcher.BeginInvoke(DispatcherPriority.Input, () =>
+        {
+            if (generation != _animationGeneration || !IsSpotlightOpen || _isClosing) return;
+            ForceForeground();
+            SearchBox.Focus();
+            Keyboard.Focus(SearchBox);
+        });
+    }
+
+    private void ForceForeground()
+    {
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero)
+        {
+            Activate();
+            return;
+        }
+
+        IntPtr foreground = GetForegroundWindow();
+        if (foreground == hwnd)
+        {
+            Activate();
+            return;
+        }
+
+        // When Spotlight is toggled from the low-level keyboard hook (Alt+Space
+        uint thisThread = GetCurrentThreadId();
+        uint foregroundThread = 0;
+        if (foreground != IntPtr.Zero)
+            foregroundThread = GetWindowThreadProcessId(foreground, out _);
+
+        bool attached = foregroundThread != 0
+            && foregroundThread != thisThread
+            && AttachThreadInput(thisThread, foregroundThread, true);
+        try
+        {
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+            Activate();
+        }
+        catch (InvalidOperationException)
+        {
+            // Window is mid-close; nothing to focus.
+        }
+        finally
+        {
+            if (attached) AttachThreadInput(thisThread, foregroundThread, false);
+        }
+    }
+
+    internal void ToggleFromHotkey()
+    {
+        if (_isClosing)
+        {
+            ReverseExitToEntrance();
+            return;
+        }
+
+        if (!IsSpotlightOpen)
+        {
+            ShowSpotlight();
+            return;
+        }
+
+        DismissFromGlobalShortcut();
+    }
+
+    internal void DismissFromGlobalShortcut()
+    {
+        if (!IsSpotlightOpen) return;
+        if (_isClosing)
+        {
+            // A repeated dismissal must finish an in-flight deactivation
+            ++_animationGeneration;
+            CompleteHide();
+            _lastDismissedQuery = null;
+            return;
+        }
+
+        HideSpotlight();
+        // Toggling Spotlight away is an explicit abandon, unlike a focus loss;
+        _lastDismissedQuery = null;
+    }
+
+    internal void HandleGlobalEscape()
+    {
+        if (!IsSpotlightOpen) return;
+        if (_aiMode) { EscapeAiMode(); return; }
+        _pendingLaunchQuery = null;
+        if (!_isClosing && !string.IsNullOrEmpty(SearchBox.Text))
+        {
+            // First Escape clears the query; a second one dismisses the window.
+            SearchBox.Clear();
+            SearchBox.Focus();
+            return;
+        }
+
+        DismissFromGlobalShortcut();
+    }
+
+    internal void HideSpotlight()
+    {
+        if (!IsSpotlightOpen || _isClosing) return;
+        PlaySpotlightClickSfx();
+        CloseResultContextMenu();
+        SaveAiHistory();
+        StopAiActivity();
+        _lastDismissedQuery = SearchBox.Text;
+        _lastDismissedAtUtc = DateTime.UtcNow;
+        _isClosing = true;
+        InvalidateLaunchAttempt();
+        CancelSearchDebounce();
+        _viewModel.CancelPendingSearch();
+        SearchBox.IsEnabled = false;
+        int generation = ++_animationGeneration;
+        if (CancelPendingFreshEntrance())
+        {
+            // The live source was never hidden, so there is no morph frame to
+            CompleteHide();
+            return;
+        }
+        PlayExit(generation);
+    }
+
+    internal void Shutdown()
+    {
+        ++_animationGeneration;
+        _allowClose = true;
+        CancelAiRequest();
+        SaveAiHistory();
+        StopAiActivity();
+        CancelSearchDebounce();
+        ClearLaunchFailure();
+        CancelSearchingGrace();
+        _glassResourceExpiry?.Dispose();
+        _glassResourceExpiry = null;
+        CancelPendingFreshEntrance();
+        ClearMorphAnimations();
+        ReleaseMorphSession();
+        CompositionTarget.Rendering -= OnLiquidGlassFrameUpdate;
+        _liquidGlass?.Stop();
+        DetachGpuRefraction();
+        _liquidGlass?.Dispose();
+        _liquidGlass = null;
+        _viewModel.Dispose();
+        Close();
+    }
+
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (!_allowClose)
+        {
+            e.Cancel = true;
+            HideSpotlight();
+        }
+        base.OnClosing(e);
+    }
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        _hwnd = EnsureHwnd();
+        if (_hwnd != IntPtr.Zero)
+        {
+            _hwndSource = HwndSource.FromHwnd(_hwnd);
+            _hwndSource?.AddHook(WindowProc);
+        }
+        if (IsLiquidGlassEnabled && IsSpotlightOpen && !_isClosing && !_preparingGlassEntrance)
+        {
+            _liquidGlass?.Start();
+        }
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        AnimationConfig.ReduceMotionChanged -= OnSearchMotionPreferenceChanged;
+        SetSearchActivity(false);
+        ClearLaunchFailure();
+        CancelSearchingGrace();
+        _glassResourceExpiry?.Dispose();
+        _glassResourceExpiry = null;
+        CompositionTarget.Rendering -= OnLiquidGlassFrameUpdate;
+        _liquidGlass?.Stop();
+        DetachGpuRefraction();
+        _liquidGlass?.Dispose();
+        _liquidGlass = null;
+        _hwndSource?.RemoveHook(WindowProc);
+        _hwndSource = null;
+        _hwnd = IntPtr.Zero;
+        base.OnClosed(e);
+    }
+
+    private IntPtr WindowProc(
+        IntPtr hwnd,
+        int message,
+        IntPtr wParam,
+        IntPtr lParam,
+        ref bool handled)
+    {
+        if (_isParked && message == WM_NCHITTEST)
+        {
+            handled = true;
+            return new IntPtr(HTTRANSPARENT);
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private void ParkWindow()
+    {
+        if (_isParked || !IsVisible) return;
+
+        _unparkedWindowOpacity = Opacity;
+        _unparkedWindowHitTesting = IsHitTestVisible;
+        _unparkedWindowFocusable = Focusable;
+        _isParked = true;
+        OpenStateChanged?.Invoke(this, EventArgs.Empty);
+
+        Keyboard.ClearFocus();
+        Focusable = false;
+        IsHitTestVisible = false;
+        Opacity = 0;
+
+        _liquidGlass?.ClearLiveRegion();
+        RetainGlassForReopen();
+        CompositionTarget.Rendering -= OnLiquidGlassFrameUpdate;
+
+        // Hide() used to return activation to the previous foreground app.
+        IntPtr hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd != IntPtr.Zero
+            && GetForegroundWindow() == hwnd
+            && _previousForegroundWindow != IntPtr.Zero
+            && _previousForegroundWindow != hwnd)
+        {
+            SetForegroundWindow(_previousForegroundWindow);
+        }
+    }
+
+    private void UnparkWindow()
+    {
+        if (!_isParked) return;
+
+        Opacity = _unparkedWindowOpacity;
+        Focusable = _unparkedWindowFocusable;
+        IsHitTestVisible = _unparkedWindowHitTesting;
+
+        _isParked = false;
+        OpenStateChanged?.Invoke(this, EventArgs.Empty);
+        ApplyLiquidGlassSkin();
+    }
+
+    private async void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        // CompleteHide clears the input while closing. Reset its overlays even
+        // then: reopening with an already-empty input raises no TextChanged.
+        PlaceholderText.Visibility = string.IsNullOrEmpty(SearchBox.Text)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        AutocompleteText.Visibility = Visibility.Collapsed;
+        if (_allowClose || _isClosing) return;
+        if (_aiMode)
+        {
+            UpdateGlowingCaret();
+            PlayTypingAnimation();
+            UpdateAiActionState();
+            return;
+        }
+        PlayTypingAnimation();
+        CloseResultContextMenu();
+        UpdateGlowingCaret();
+        CancelSearchingGrace();
+        _pendingLaunchQuery = null;
+        ClearLaunchFailure();
+
+        CancelSearchDebounce();
+        _searchInputPending = !string.IsNullOrEmpty(SearchBox.Text);
+        // Invalidate the old query immediately, not after the new debounce.
+        _viewModel.CancelPendingSearch();
+
+        string currentText = SearchBox.Text;
+
+        if (string.IsNullOrEmpty(currentText))
+        {
+            _searchDebounceCts = null;
+            _searchInputPending = false;
+            await _viewModel.SearchAsync(currentText);
+            ScheduleStatusRefresh();
+            return;
+        }
+
+        // Keep the current rows at full opacity while the replacement query
+        // runs. Dimming and restoring on every keystroke creates a flash.
+
+        var cts = new CancellationTokenSource();
+        _searchDebounceCts = cts;
+        CancellationToken token = cts.Token;
+
+        try
+        {
+            if (IsSpotlightOpen) await Task.Delay(120, token);
+            if (token.IsCancellationRequested || _isClosing || _allowClose ||
+                !ReferenceEquals(_searchDebounceCts, cts)) return;
+
+            _searchInputPending = false;
+            await _viewModel.SearchAsync(currentText);
+            if (!token.IsCancellationRequested && !_isClosing && !_allowClose)
+                ScheduleStatusRefresh();
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+        {
+            // Cancelled due to rapid typing or window closure
+        }
+        finally
+        {
+            if (ReferenceEquals(_searchDebounceCts, cts)) _searchDebounceCts = null;
+            cts.Dispose();
+        }
+    }
+
+    private void CancelSearchDebounce()
+    {
+        _searchInputPending = false;
+        var pending = _searchDebounceCts;
+        _searchDebounceCts = null;
+        pending?.Cancel(); // The owning handler disposes it in finally.
+    }
+
+    private void SearchBox_GotFocus(object sender, RoutedEventArgs e) => UpdateGlowingCaret();
+
+    private void SearchBox_LostFocus(object sender, RoutedEventArgs e) => GlowingCaret.Visibility = Visibility.Collapsed;
+
+    private void SearchBox_SelectionChanged(object sender, RoutedEventArgs e) => UpdateGlowingCaret();
+
+    private void UpdateGlowingCaret()
+    {
+        if (!SearchBox.IsFocused || !IsVisible || SearchBox.SelectionLength > 0)
+        {
+            GlowingCaret.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        try
+        {
+            CaretGlow.Color = Colors.White;
+            GlowingCaret.Background = Brushes.White;
+
+            int textLength = SearchBox.Text?.Length ?? 0;
+            int caretIndex = Math.Clamp(SearchBox.CaretIndex, 0, textLength);
+            Rect rect = GetSearchBoxCaretRect(caretIndex, textLength);
+            if (rect.IsEmpty)
+            {
+                SearchBox.UpdateLayout();
+                rect = GetSearchBoxCaretRect(caretIndex, textLength);
+            }
+
+            double left = (!rect.IsEmpty && double.IsFinite(rect.Left)) ? Math.Max(2, rect.Left) : 2;
+            if (SearchBox.ActualWidth > 4)
+                left = Math.Min(left, SearchBox.ActualWidth - GlowingCaret.Width);
+
+            GlowingCaret.Margin = new Thickness(left, 0, 0, 0);
+            GlowingCaret.Visibility = Visibility.Visible;
+            ResetGlowingCaretBlink();
+        }
+        catch
+        {
+            GlowingCaret.Margin = new Thickness(2, 0, 0, 0);
+            GlowingCaret.Visibility = Visibility.Visible;
+        }
+    }
+
+    private Rect GetSearchBoxCaretRect(int caretIndex, int textLength) =>
+        caretIndex > 0 && caretIndex >= textLength
+            ? SearchBox.GetRectFromCharacterIndex(textLength - 1, trailingEdge: true)
+            : SearchBox.GetRectFromCharacterIndex(caretIndex, trailingEdge: false);
+
+    private void ResetGlowingCaretBlink()
+    {
+        GlowingCaret.BeginAnimation(OpacityProperty, null);
+        GlowingCaret.Opacity = 1.0;
+
+        if (AnimationConfig.ReduceMotion) return;
+
+        var blinkAnim = new DoubleAnimation
+        {
+            From = 1.0,
+            To = 0.15,
+            Duration = TimeSpan.FromMilliseconds(520),
+            AutoReverse = true,
+            RepeatBehavior = RepeatBehavior.Forever,
+            EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut }
+        };
+        Timeline.SetDesiredFrameRate(blinkAnim, AnimationConfig.TargetFps);
+        GlowingCaret.BeginAnimation(OpacityProperty, blinkAnim);
+    }
+
+    private void PlayTypingAnimation()
+    {
+        if (AnimationConfig.ReduceMotion) return;
+
+        var caretGlowBurst = new DoubleAnimationUsingKeyFrames();
+        caretGlowBurst.KeyFrames.Add(new LinearDoubleKeyFrame(10, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(0))));
+        caretGlowBurst.KeyFrames.Add(new EasingDoubleKeyFrame(18, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(35)), new CubicEase { EasingMode = EasingMode.EaseOut }));
+        caretGlowBurst.KeyFrames.Add(new EasingDoubleKeyFrame(10, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(140)), new QuadraticEase { EasingMode = EasingMode.EaseOut }));
+        Timeline.SetDesiredFrameRate(caretGlowBurst, AnimationConfig.TargetFps);
+        CaretGlow.BeginAnimation(DropShadowEffect.BlurRadiusProperty, caretGlowBurst);
+
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct VnQuickActionsSlideMotionOut
+    {
+        public double ResultsFromX;
+        public double ResultsToX;
+        public double ActionsFromX;
+        public double ActionsToX;
+        public double ItemSlideX;
+        public int ExitDurationMs;
+        public int EnterDurationMs;
+        public int StaggerStepMs;
+    }
+
+    [LibraryImport("VNotch.Native", EntryPoint = "vn_animation_compute_spotlight_quick_actions_motion")]
+    private static unsafe partial int NativeComputeSpotlightQuickActionsMotion(
+        byte entering,
+        double viewportWidth,
+        byte reducedMotion,
+        VnQuickActionsSlideMotionOut* outMotion);
+
+    private ContextMenu? _activeResultMenu;
+    private int _activeResultMenuIndex = -1;
+    private bool _quickActionsOpen;
+    private int _quickActionsSlideVersion;
+    private readonly List<Action> _quickActionCallbacks = new();
+
+    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (_personalizationOpen) return;
+        if (HandleResultMenuKey(e)) return;
+        if (HandleAiKey(e)) return;
+        // Navigation keys must be intercepted on the tunnel: the search box's
+        if (e.Key == Key.Down)
+        {
+            MoveSelection(1);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Up || (e.Key == Key.Tab && Keyboard.Modifiers == ModifierKeys.Shift))
+        {
+            MoveSelection(-1);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.PageDown)
+        {
+            MoveSelection(PageJump);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.PageUp)
+        {
+            MoveSelection(-PageJump);
+            e.Handled = true;
+        }
+        else if ((e.Key == Key.Right && Keyboard.Modifiers == ModifierKeys.None && CanOpenQuickActionsFromCaret()) ||
+                 e.Key == Key.Apps ||
+                 (e.Key == Key.F10 && Keyboard.Modifiers == ModifierKeys.Shift))
+        {
+            if (_viewModel.SelectedResult is { } selected)
+            {
+                OpenResultContextMenu(selected, openedByKeyboard: true);
+                e.Handled = true;
+            }
+        }
+        else if (e.Key == Key.Escape)
+        {
+            HandleGlobalEscape();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Enter)
+        {
+            if (e.IsRepeat && _viewModel.SelectedResult == null)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            ModifierKeys modifiers = Keyboard.Modifiers;
+            if (modifiers == (ModifierKeys.Control | ModifierKeys.Shift)) LaunchSelectedElevated();
+            else if ((modifiers & ModifierKeys.Control) != 0) RevealSelected();
+            else LaunchSelected();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.C && Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift))
+        {
+            CopySelected();
+            e.Handled = true;
+        }
+        else if (e.Key is >= Key.D1 and <= Key.D9 && Keyboard.Modifiers == ModifierKeys.Control)
+        {
+            int index = e.Key - Key.D1;
+            if (index < _viewModel.Results.Count)
+            {
+                _viewModel.SelectedResult = _viewModel.Results[index];
+                LaunchSelected();
+            }
+            e.Handled = true;
+        }
+    }
+
+    private bool CanOpenQuickActionsFromCaret() =>
+        _viewModel.SelectedResult != null &&
+        SearchBox.SelectionLength == 0 &&
+        SearchBox.CaretIndex >= (SearchBox.Text?.Length ?? 0);
+
+    private bool HandleResultMenuKey(KeyEventArgs e)
+    {
+        if (e.Handled || !_quickActionsOpen || _quickActionCallbacks.Count == 0)
+            return false;
+
+        int count = _quickActionCallbacks.Count;
+        if (e.Key == Key.Down || (e.Key == Key.Tab && Keyboard.Modifiers == ModifierKeys.None))
+        {
+            SelectQuickActionIndex(_activeResultMenuIndex < 0 ? 0 : _activeResultMenuIndex + 1, animateGlide: true);
+            e.Handled = true;
+            return true;
+        }
+        if (e.Key == Key.Up || (e.Key == Key.Tab && Keyboard.Modifiers == ModifierKeys.Shift))
+        {
+            SelectQuickActionIndex(_activeResultMenuIndex <= 0 ? count - 1 : _activeResultMenuIndex - 1, animateGlide: true);
+            e.Handled = true;
+            return true;
+        }
+        if (e.Key is Key.Enter or Key.Space)
+        {
+            int idx = _activeResultMenuIndex >= 0 && _activeResultMenuIndex < count ? _activeResultMenuIndex : 0;
+            Action callback = _quickActionCallbacks[idx];
+            CloseResultContextMenu(animate: false);
+            callback();
+            e.Handled = true;
+            return true;
+        }
+        if (e.Key is Key.Left or Key.Escape)
+        {
+            CloseResultContextMenu(animate: true);
+            if (IsSpotlightOpen && !_isClosing && !_personalizationOpen)
+                SearchBox.Focus();
+            e.Handled = true;
+            return true;
+        }
+        return false;
+    }
+
+    private void QuickActionsBack_Click(object sender, RoutedEventArgs e)
+    {
+        CloseResultContextMenu(animate: true);
+        if (IsSpotlightOpen && !_isClosing && !_personalizationOpen)
+            SearchBox.Focus();
+    }
+
+    private readonly List<System.Windows.Shapes.Path> _quickActionRightIcons = new();
+    private readonly List<ScaleTransform> _quickActionIconScales = new();
+
+    private void SelectQuickActionIndex(int index, bool animateGlide)
+    {
+        int count = _quickActionCallbacks.Count;
+        if (count == 0) return;
+        _activeResultMenuIndex = ((index % count) + count) % count;
+
+        if (_activeResultMenu != null)
+        {
+            for (int i = 0; i < _activeResultMenu.Items.Count; i++)
+            {
+                if (_activeResultMenu.Items[i] is MenuItem mi)
+                    mi.Tag = i == _activeResultMenuIndex ? "Selected" : null;
+            }
+        }
+
+        bool animateIcons = animateGlide && !AnimationConfig.ReduceMotion;
+        for (int i = 0; i < _quickActionRightIcons.Count; i++)
+        {
+            bool isSelected = i == _activeResultMenuIndex;
+            double targetOpacity = isSelected ? 0.96 : 0.56;
+            double targetScale = isSelected ? 1.1 : 1.0;
+            var icon = _quickActionRightIcons[i];
+            if (animateIcons)
+            {
+                var fade = AnimationPrimitives.MakeAnim(targetOpacity, new Duration(TimeSpan.FromMilliseconds(140)), CreateContentResizeEase());
+                icon.BeginAnimation(OpacityProperty, fade);
+                if (i < _quickActionIconScales.Count)
+                {
+                    var scaleAnim = AnimationPrimitives.MakeAnim(targetScale, new Duration(TimeSpan.FromMilliseconds(160)), CreateContentResizeEase());
+                    _quickActionIconScales[i].BeginAnimation(ScaleTransform.ScaleXProperty, scaleAnim);
+                    _quickActionIconScales[i].BeginAnimation(ScaleTransform.ScaleYProperty, scaleAnim);
+                }
+            }
+            else
+            {
+                icon.BeginAnimation(OpacityProperty, null);
+                icon.Opacity = targetOpacity;
+                if (i < _quickActionIconScales.Count)
+                {
+                    _quickActionIconScales[i].BeginAnimation(ScaleTransform.ScaleXProperty, null);
+                    _quickActionIconScales[i].BeginAnimation(ScaleTransform.ScaleYProperty, null);
+                    _quickActionIconScales[i].ScaleX = targetScale;
+                    _quickActionIconScales[i].ScaleY = targetScale;
+                }
+            }
+        }
+
+        UpdateQuickActionsSelectionGlide(animateGlide);
+    }
+
+    private void UpdateQuickActionsSelectionGlide(bool animate)
+    {
+        if (!_quickActionsOpen || _activeResultMenuIndex < 0 || _activeResultMenuIndex >= QuickActionsItems.Children.Count)
+        {
+            QuickActionsSelectionGlide.Opacity = 0;
+            return;
+        }
+
+        if (QuickActionsItems.Children[_activeResultMenuIndex] is not FrameworkElement row)
+            return;
+
+        QuickActionsItems.UpdateLayout();
+        double rowHeight = row.ActualHeight > 0 ? row.ActualHeight : 38;
+        double rowWidth = row.ActualWidth > 0 ? row.ActualWidth : Math.Max(120, Shell.ActualWidth - 18);
+        Point offset = row.TranslatePoint(new Point(0, 0), QuickActionsItems);
+        double targetY = double.IsFinite(offset.Y) ? offset.Y : _activeResultMenuIndex * (rowHeight + 4);
+
+        QuickActionsSelectionGlide.Margin = new Thickness(row.Margin.Left, 0, row.Margin.Right, 0);
+        QuickActionsSelectionGlide.Width = rowWidth;
+        QuickActionsSelectionGlide.Height = rowHeight;
+        QuickActionsSelectionGlide.Opacity = 1;
+
+        if (!animate || AnimationConfig.ReduceMotion)
+        {
+            QuickActionsGlideTransform.BeginAnimation(TranslateTransform.YProperty, null);
+            QuickActionsGlideTransform.Y = targetY;
+            return;
+        }
+
+        var glideAnim = new DoubleAnimation(targetY, TimeSpan.FromMilliseconds(165))
+        {
+            EasingFunction = CreateContentResizeEase()
+        };
+        Timeline.SetDesiredFrameRate(glideAnim, AnimationConfig.TargetFps);
+        QuickActionsGlideTransform.BeginAnimation(TranslateTransform.YProperty, glideAnim, HandoffBehavior.SnapshotAndReplace);
+    }
+
+    private double MeasureTargetContentHeight()
+    {
+        var inset = ContentRegion.BorderThickness;
+        var padding = ContentRegion.Padding;
+        double baseWidth = ContentRegion.ActualWidth > 0 ? ContentRegion.ActualWidth : Shell.ActualWidth;
+        double width = Math.Max(1, baseWidth - inset.Left - inset.Right - padding.Left - padding.Right);
+
+        Visibility savedResultsVis = ResultsList.Visibility;
+        Visibility savedActionsVis = QuickActionsPanel.Visibility;
+        if (_quickActionsOpen && ResultsList.Visibility == Visibility.Visible)
+            ResultsList.Visibility = Visibility.Collapsed;
+        else if (!_quickActionsOpen && QuickActionsPanel.Visibility == Visibility.Visible)
+            QuickActionsPanel.Visibility = Visibility.Collapsed;
+
+        InvalidateMeasureRecursive(ContentRegion.Child);
+        ContentRegion.Child.Measure(new Size(width, double.PositiveInfinity));
+        double desiredHeight = ContentRegion.Child.DesiredSize.Height;
+
+        ResultsList.Visibility = savedResultsVis;
+        QuickActionsPanel.Visibility = savedActionsVis;
+
+        return desiredHeight + inset.Top + inset.Bottom + padding.Top + padding.Bottom;
+    }
+
+    private static void InvalidateMeasureRecursive(DependencyObject? root)
+    {
+        if (root is not UIElement element) return;
+        element.InvalidateMeasure();
+        int count = VisualTreeHelper.GetChildrenCount(element);
+        for (int i = 0; i < count; i++)
+        {
+            InvalidateMeasureRecursive(VisualTreeHelper.GetChild(element, i));
+        }
+    }
+
+    private void AnimateQuickActionsViewportHeight(double? lockedOldHeight = null)
+    {
+        if (!_contentShown || _entranceActive) return;
+        double oldHeight = lockedOldHeight is > 0 ? lockedOldHeight.Value : ContentRegion.ActualHeight;
+        if (oldHeight <= 0)
+        {
+            ScheduleContentResize();
+            return;
+        }
+
+        int generation = ++_contentSizeGeneration;
+        ContentRegion.Height = oldHeight;
+        ContentRegion.ClipToBounds = true;
+
+        double target = MeasureTargetContentHeight();
+        if (!double.IsFinite(target) || Math.Abs(target - oldHeight) < 1)
+        {
+            ++_contentHeightAnimationVersion;
+            _contentHeightTarget = target;
+            ContentRegion.BeginAnimation(HeightProperty, null);
+            ContentRegion.Height = double.NaN;
+            ContentRegion.ClipToBounds = false;
+            return;
+        }
+
+        BeginContentHeightAnimation(oldHeight, target, generation);
+    }
+
+    private unsafe void CloseResultContextMenu(bool animate = false)
+    {
+        if (_activeResultMenu is { IsOpen: true } popupMenu)
+            popupMenu.IsOpen = false;
+        _activeResultMenu = null;
+        _activeResultMenuIndex = -1;
+
+        if (!_quickActionsOpen) return;
+        _quickActionsOpen = false;
+        _resultMenuOpen = false;
+        int slideGen = ++_quickActionsSlideVersion;
+
+        bool canAnimate = animate && !AnimationConfig.ReduceMotion && IsSpotlightOpen && !_isClosing;
+        if (!canAnimate)
+        {
+            QuickActionsPanel.BeginAnimation(OpacityProperty, null);
+            QuickActionsTranslate.BeginAnimation(TranslateTransform.XProperty, null);
+            QuickActionsTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+            QuickActionsPanel.Opacity = 0;
+            QuickActionsTranslate.X = 0;
+            QuickActionsTranslate.Y = 0;
+            QuickActionsPanel.Visibility = Visibility.Collapsed;
+
+            ResultsList.BeginAnimation(OpacityProperty, null);
+            ResultsListTranslate.BeginAnimation(TranslateTransform.XProperty, null);
+            ResultsListTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+            ResultsList.Opacity = 1;
+            ResultsListTranslate.X = 0;
+            ResultsListTranslate.Y = 0;
+            ResultsList.IsHitTestVisible = true;
+            if (_viewModel.Results.Count > 0)
+                ResultsList.Visibility = Visibility.Visible;
+            ScheduleContentResize();
+            ScheduleGlideUpdate();
+            return;
+        }
+
+        VnQuickActionsSlideMotionOut motion;
+        NativeComputeSpotlightQuickActionsMotion(0, Shell.ActualWidth, 0, &motion);
+
+        double lockedHeight = ContentRegion.ActualHeight;
+        if (lockedHeight > 0)
+        {
+            ContentRegion.Height = lockedHeight;
+            ContentRegion.ClipToBounds = true;
+        }
+
+        ResultsList.Visibility = Visibility.Visible;
+        ResultsList.IsHitTestVisible = true;
+        QuickActionsPanel.IsHitTestVisible = false;
+
+        var exitDur = new Duration(TimeSpan.FromMilliseconds(motion.ExitDurationMs));
+        var enterDur = new Duration(TimeSpan.FromMilliseconds(motion.EnterDurationMs));
+        var revealEase = CreateContentResizeEase();
+        var contractEase = CreateContentContractEase();
+
+        var actionsOutX = AnimationPrimitives.MakeAnim(QuickActionsTranslate.X, motion.ActionsToX, exitDur, contractEase);
+        var actionsOutY = AnimationPrimitives.MakeAnim(QuickActionsTranslate.Y, -4, exitDur, contractEase);
+        var actionsOutFade = AnimationPrimitives.MakeAnim(QuickActionsPanel.Opacity, 0, exitDur, contractEase);
+        actionsOutFade.Completed += (_, _) =>
+        {
+            if (slideGen != _quickActionsSlideVersion || _quickActionsOpen) return;
+            QuickActionsPanel.BeginAnimation(OpacityProperty, null);
+            QuickActionsTranslate.BeginAnimation(TranslateTransform.XProperty, null);
+            QuickActionsTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+            QuickActionsPanel.Opacity = 0;
+            QuickActionsTranslate.X = 0;
+            QuickActionsTranslate.Y = 0;
+            QuickActionsPanel.Visibility = Visibility.Collapsed;
+        };
+        QuickActionsTranslate.BeginAnimation(TranslateTransform.XProperty, actionsOutX);
+        QuickActionsTranslate.BeginAnimation(TranslateTransform.YProperty, actionsOutY);
+        QuickActionsPanel.BeginAnimation(OpacityProperty, actionsOutFade);
+
+        var resultsInX = AnimationPrimitives.MakeAnim(motion.ResultsFromX, motion.ResultsToX, enterDur, revealEase);
+        var resultsInY = AnimationPrimitives.MakeAnim(-8, 0, enterDur, revealEase);
+        var resultsInFade = AnimationPrimitives.MakeAnim(0, 1, new Duration(TimeSpan.FromMilliseconds(230)), revealEase);
+        resultsInX.FillBehavior = FillBehavior.Stop;
+        resultsInY.FillBehavior = FillBehavior.Stop;
+        resultsInFade.FillBehavior = FillBehavior.Stop;
+        ResultsListTranslate.X = 0;
+        ResultsListTranslate.Y = 0;
+        ResultsList.Opacity = 1;
+        ResultsListTranslate.BeginAnimation(TranslateTransform.XProperty, resultsInX);
+        ResultsListTranslate.BeginAnimation(TranslateTransform.YProperty, resultsInY);
+        ResultsList.BeginAnimation(OpacityProperty, resultsInFade);
+
+        AnimateQuickActionsViewportHeight(lockedHeight);
+        ScheduleGlideUpdate();
+    }
+
+    private void ResultItem_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is not ListBoxItem { DataContext: SpotlightSearchItem item }) return;
+        _viewModel.SelectedResult = item;
+        LaunchSelected();
+        // If the launch failed and the window stays open, typing must keep working.
+        if (IsSpotlightOpen && !_isClosing) SearchBox.Focus();
+    }
+
+    private void ResultItem_MouseRightButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is not ListBoxItem { DataContext: SpotlightSearchItem item } container) return;
+        OpenResultContextMenu(item, container, openedByKeyboard: true);
+        e.Handled = true;
+    }
+
+    private unsafe ContextMenu OpenResultContextMenu(SpotlightSearchItem item, FrameworkElement? container = null, bool openedByKeyboard = false)
+    {
+        _viewModel.SelectedResult = item;
+        _quickActionCallbacks.Clear();
+        _quickActionRightIcons.Clear();
+        _quickActionIconScales.Clear();
+        QuickActionsItems.Children.Clear();
+
+        var menu = new ContextMenu
+        {
+            Style = (Style)FindResource("SpotlightContextMenuStyle")
+        };
+
+        if (item.Kind == SpotlightResultKind.Calculation)
+        {
+            AddMenuItem(menu, Loc.Get("spotlight.copy"), () =>
+            {
+                if (TryCopyToClipboard(item.Target)) HideSpotlight();
+            }, QuickActionCopyGeometry);
+        }
+        else
+        {
+            AddMenuItem(menu, item.Kind == SpotlightResultKind.SystemAction ? item.Title : Loc.Get("spotlight.open"), LaunchSelected, QuickActionOpenGeometry);
+            if (SpotlightLauncher.CanLaunchElevated(item))
+                AddMenuItem(menu, Loc.Get("spotlight.runAsAdmin"), LaunchSelectedElevated, QuickActionAdminGeometry);
+            if (SpotlightLauncher.CanReveal(item))
+                AddMenuItem(menu, Loc.Get("spotlight.reveal"), RevealSelected, QuickActionFolderGeometry);
+            if (SpotlightLauncher.GetCopyableText(item) != null)
+                AddMenuItem(menu, Loc.Get("spotlight.copyPath"), CopySelected, QuickActionCopyGeometry);
+        }
+
+        AddPersonalizationActions(menu, item);
+
+        QuickActionsTargetIcon.Source = item.Icon;
+        QuickActionsTargetIcon.Visibility = item.Icon != null ? Visibility.Visible : Visibility.Collapsed;
+        QuickActionsTargetSolidIcon.Data = item.SolidIcon;
+        QuickActionsTargetSolidBox.Visibility = item.Icon == null && item.SolidIcon != null ? Visibility.Visible : Visibility.Collapsed;
+        QuickActionsTargetTitle.Text = item.DisplayTitle;
+        QuickActionsTargetSubtitle.Text = item.DisplaySubtitle;
+        QuickActionsTargetSubtitle.Visibility = string.IsNullOrWhiteSpace(item.DisplaySubtitle) ? Visibility.Collapsed : Visibility.Visible;
+
+        VnQuickActionsSlideMotionOut motion;
+        NativeComputeSpotlightQuickActionsMotion(1, Shell.ActualWidth, AnimationConfig.ReduceMotion ? (byte)1 : (byte)0, &motion);
+
+        var sfPro = (FontFamily)FindResource("SFProDisplay");
+        var primaryBrush = (Brush)FindResource("TitleTextBrush");
+        var hoverBrush = (Brush)FindResource("HoverItemBrush");
+        var revealEase = CreateContentResizeEase();
+
+        for (int i = 0; i < menu.Items.Count; i++)
+        {
+            if (menu.Items[i] is not MenuItem mi) continue;
+            int actionIndex = _quickActionCallbacks.Count;
+            Action callback = () => mi.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            _quickActionCallbacks.Add(callback);
+
+            var rowTranslate = new TranslateTransform(motion.ItemSlideX, 0);
+            var hoverSurface = new Border
+            {
+                Background = hoverBrush,
+                CornerRadius = new CornerRadius(8),
+                Opacity = 0,
+                IsHitTestVisible = false
+            };
+
+            var rowGrid = new Grid();
+            rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var labelText = new TextBlock
+            {
+                Text = mi.Header?.ToString() ?? string.Empty,
+                FontFamily = sfPro,
+                FontSize = 13.5,
+                FontWeight = FontWeights.Bold,
+                Foreground = primaryBrush,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            rowGrid.Children.Add(labelText);
+
+            var iconGeom = mi.DataContext as Geometry ?? QuickActionOpenGeometry;
+            double initialOpacity = actionIndex == 0 ? 0.96 : 0.56;
+            double initialScale = actionIndex == 0 ? 1.1 : 1.0;
+            var iconScale = new ScaleTransform(initialScale, initialScale);
+            var rightIcon = new System.Windows.Shapes.Path
+            {
+                Data = iconGeom,
+                Fill = Brushes.White,
+                Stretch = Stretch.None,
+                Opacity = initialOpacity,
+                IsHitTestVisible = false
+            };
+            var iconCanvas = new Canvas
+            {
+                Width = 24,
+                Height = 24
+            };
+            iconCanvas.Children.Add(rightIcon);
+            var iconViewbox = new Viewbox
+            {
+                Width = 16,
+                Height = 16,
+                Stretch = Stretch.Uniform,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(14, 0, 2, 0),
+                RenderTransformOrigin = new Point(0.5, 0.5),
+                RenderTransform = iconScale,
+                IsHitTestVisible = false,
+                Child = iconCanvas
+            };
+            Grid.SetColumn(iconViewbox, 1);
+            rowGrid.Children.Add(iconViewbox);
+            _quickActionRightIcons.Add(rightIcon);
+            _quickActionIconScales.Add(iconScale);
+
+            var contentBorder = new Border
+            {
+                Padding = new Thickness(15, 7, 15, 7),
+                Child = rowGrid
+            };
+
+            var rowContainer = new Grid
+            {
+                Margin = new Thickness(9, 1, 9, 1),
+                Background = Brushes.Transparent,
+                Cursor = Cursors.Hand,
+                RenderTransform = rowTranslate
+            };
+            rowContainer.Children.Add(hoverSurface);
+            rowContainer.Children.Add(contentBorder);
+
+            rowContainer.MouseEnter += (_, _) =>
+            {
+                SelectQuickActionIndex(actionIndex, animateGlide: true);
+                var hoverIn = new DoubleAnimation(1, TimeSpan.FromMilliseconds(120)) { EasingFunction = revealEase };
+                hoverSurface.BeginAnimation(OpacityProperty, hoverIn);
+            };
+            rowContainer.MouseLeave += (_, _) =>
+            {
+                var hoverOut = new DoubleAnimation(0, TimeSpan.FromMilliseconds(160)) { EasingFunction = revealEase };
+                hoverSurface.BeginAnimation(OpacityProperty, hoverOut);
+            };
+            rowContainer.MouseLeftButtonUp += (_, me) =>
+            {
+                CloseResultContextMenu(animate: false);
+                callback();
+                me.Handled = true;
+            };
+
+            QuickActionsItems.Children.Add(rowContainer);
+
+            if (!AnimationConfig.ReduceMotion && motion.EnterDurationMs > 0)
+            {
+                rowContainer.Opacity = 0;
+                rowTranslate.Y = -5;
+                rightIcon.Opacity = 0;
+                iconScale.ScaleX = 0.68;
+                iconScale.ScaleY = 0.68;
+
+                var delay = TimeSpan.FromMilliseconds(actionIndex * motion.StaggerStepMs);
+                var iconDelay = TimeSpan.FromMilliseconds(actionIndex * motion.StaggerStepMs + 25);
+                var dur = new Duration(TimeSpan.FromMilliseconds(motion.EnterDurationMs));
+                var fadeDur = new Duration(TimeSpan.FromMilliseconds(220));
+
+                var rowSlideX = AnimationPrimitives.MakeAnim(motion.ItemSlideX, 0, dur, revealEase, delay);
+                var rowSlideY = AnimationPrimitives.MakeAnim(-5, 0, dur, revealEase, delay);
+                var rowFade = AnimationPrimitives.MakeAnim(0, 1, fadeDur, revealEase, delay);
+                rowTranslate.BeginAnimation(TranslateTransform.XProperty, rowSlideX);
+                rowTranslate.BeginAnimation(TranslateTransform.YProperty, rowSlideY);
+                rowContainer.BeginAnimation(OpacityProperty, rowFade);
+
+                var iconFade = AnimationPrimitives.MakeAnim(0, initialOpacity, fadeDur, revealEase, iconDelay);
+                var iconScaleIn = AnimationPrimitives.MakeAnim(0.68, initialScale, dur, AnimationPrimitives._easeBackOut022, iconDelay);
+                rightIcon.BeginAnimation(OpacityProperty, iconFade);
+                iconScale.BeginAnimation(ScaleTransform.ScaleXProperty, iconScaleIn);
+                iconScale.BeginAnimation(ScaleTransform.ScaleYProperty, iconScaleIn);
+            }
+            else
+            {
+                rowTranslate.X = 0;
+                rowTranslate.Y = 0;
+            }
+        }
+
+        double lockedHeight = ContentRegion.ActualHeight;
+        if (lockedHeight > 0 && !AnimationConfig.ReduceMotion)
+        {
+            ContentRegion.Height = lockedHeight;
+            ContentRegion.ClipToBounds = true;
+        }
+
+        _activeResultMenu = menu;
+        _quickActionsOpen = true;
+        _resultMenuOpen = true;
+        int slideGen = ++_quickActionsSlideVersion;
+
+        QuickActionsPanel.Visibility = Visibility.Visible;
+        QuickActionsPanel.IsHitTestVisible = true;
+        SelectQuickActionIndex(0, animateGlide: false);
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+        {
+            if (_quickActionsOpen)
+                UpdateQuickActionsSelectionGlide(animate: false);
+        });
+
+        if (AnimationConfig.ReduceMotion || motion.EnterDurationMs <= 0)
+        {
+            ResultsList.BeginAnimation(OpacityProperty, null);
+            ResultsListTranslate.BeginAnimation(TranslateTransform.XProperty, null);
+            ResultsListTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+            ResultsList.Opacity = 1;
+            ResultsListTranslate.X = 0;
+            ResultsListTranslate.Y = 0;
+            ResultsList.Visibility = Visibility.Collapsed;
+
+            QuickActionsPanel.BeginAnimation(OpacityProperty, null);
+            QuickActionsTranslate.BeginAnimation(TranslateTransform.XProperty, null);
+            QuickActionsTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+            QuickActionsPanel.Opacity = 1;
+            QuickActionsTranslate.X = 0;
+            QuickActionsTranslate.Y = 0;
+            ScheduleContentResize();
+            return menu;
+        }
+
+        ResultsList.IsHitTestVisible = false;
+        var exitDur = new Duration(TimeSpan.FromMilliseconds(motion.ExitDurationMs));
+        var enterDur = new Duration(TimeSpan.FromMilliseconds(motion.EnterDurationMs));
+        var contractEase = CreateContentContractEase();
+
+        var resultsOutX = AnimationPrimitives.MakeAnim(0, motion.ResultsToX, exitDur, contractEase);
+        var resultsOutY = AnimationPrimitives.MakeAnim(0, -4, exitDur, contractEase);
+        var resultsOutFade = AnimationPrimitives.MakeAnim(1, 0, exitDur, contractEase);
+        resultsOutFade.Completed += (_, _) =>
+        {
+            if (slideGen != _quickActionsSlideVersion || !_quickActionsOpen) return;
+            ResultsList.BeginAnimation(OpacityProperty, null);
+            ResultsListTranslate.BeginAnimation(TranslateTransform.XProperty, null);
+            ResultsListTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+            ResultsList.Opacity = 1;
+            ResultsListTranslate.X = 0;
+            ResultsListTranslate.Y = 0;
+            ResultsList.IsHitTestVisible = true;
+            ResultsList.Visibility = Visibility.Collapsed;
+        };
+        ResultsListTranslate.BeginAnimation(TranslateTransform.XProperty, resultsOutX);
+        ResultsListTranslate.BeginAnimation(TranslateTransform.YProperty, resultsOutY);
+        ResultsList.BeginAnimation(OpacityProperty, resultsOutFade);
+
+        var actionsInX = AnimationPrimitives.MakeAnim(motion.ActionsFromX, motion.ActionsToX, enterDur, revealEase);
+        var actionsInY = AnimationPrimitives.MakeAnim(-8, 0, enterDur, revealEase);
+        var actionsInFade = AnimationPrimitives.MakeAnim(0, 1, new Duration(TimeSpan.FromMilliseconds(220)), revealEase);
+        QuickActionsTranslate.BeginAnimation(TranslateTransform.XProperty, actionsInX);
+        QuickActionsTranslate.BeginAnimation(TranslateTransform.YProperty, actionsInY);
+        QuickActionsPanel.BeginAnimation(OpacityProperty, actionsInFade);
+
+        AnimateQuickActionsViewportHeight(lockedHeight);
+        return menu;
+    }
+
+    private void AddMenuItem(ContextMenu menu, string header, Action action, Geometry? iconGeometry = null)
+    {
+        var menuItem = new MenuItem
+        {
+            Header = header,
+            DataContext = iconGeometry,
+            Style = (Style)FindResource("SpotlightMenuItemStyle")
+        };
+        menuItem.Click += (_, _) => action();
+        menu.Items.Add(menuItem);
+    }
+
+    private void Window_Deactivated(object? sender, EventArgs e)
+    {
+        // ApplicationIdle can be starved by the notch's continuous media/render
+        int generation = _animationGeneration;
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (generation != _animationGeneration || !IsSpotlightOpen || _isClosing || _personalizationOpen || _resultMenuOpen) return;
+            HideSpotlight();
+        }, DispatcherPriority.Input);
+    }
+
+    private void MoveSelection(int direction)
+    {
+        _pendingLaunchQuery = null;
+        int count = _viewModel.Results.Count;
+        if (count == 0) return;
+        int current = ResultsList.SelectedIndex;
+        int next;
+        if (current < 0) next = direction > 0 ? 0 : count - 1;
+        else if (Math.Abs(direction) == 1) next = (current + direction + count) % count;
+        else next = Math.Clamp(current + direction, 0, count - 1);
+        ResultsList.SelectedIndex = next;
+        ResultsList.ScrollIntoView(ResultsList.SelectedItem);
+    }
+
+    private async void LaunchSelected()
+    {
+        SpotlightSearchItem? selected = _viewModel.SelectedResult;
+        if (selected == null)
+        {
+            // Honor a fast type-and-Enter: launch the top result when the
+            // background search finishes. If not searching or no results, shake.
+            if (_viewModel.IsSearching && !string.IsNullOrWhiteSpace(SearchBox.Text))
+            {
+                _pendingLaunchQuery = SearchBox.Text;
+            }
+            else if (!string.IsNullOrWhiteSpace(SearchBox.Text))
+            {
+                PlayShake();
+            }
+            return;
+        }
+        if (_launchInFlight) return;
+
+        if (selected.Kind == SpotlightResultKind.Calculation)
+        {
+            if (TryCopyToClipboard(selected.Target)) HideSpotlight();
+            return;
+        }
+        string launchQuery = SearchBox.Text;
+
+        int launchGeneration = ++_launchGeneration;
+        int sessionGeneration = _animationGeneration;
+        _launchInFlight = true;
+        try
+        {
+            bool confirmed = false;
+            if (SpotlightSystemCatalog.RequiresConfirmation(selected))
+            {
+                _personalizationOpen = true;
+                try
+                {
+                    confirmed = Windows.ConfirmationDialog.Show(this,
+                        Loc.Get("spotlight.system.confirmMessage", selected.Title),
+                        title: selected.Title, confirmText: selected.Title,
+                        style: Windows.ConfirmationDialog.DialogStyle.Danger);
+                }
+                finally { _personalizationOpen = false; }
+                if (!confirmed || !CanCompleteLaunch(launchGeneration, sessionGeneration))
+                {
+                    if (IsSpotlightOpen && !_isClosing) SearchBox.Focus();
+                    return;
+                }
+            }
+            // ShellExecute can block for hundreds of ms on cold starts; keep
+            // the UI thread responsive so mouse exits or clicks can still abort.
+            bool launched = await Task.Run(() => _launcher.TryLaunchAsync(selected, confirmed), CancellationToken.None);
+            // A successful launch can deactivate Spotlight before ShellExecute
+            // returns. Record the captured query even if its UI session closed.
+            if (launched) _viewModel.RecordLaunch(selected, launchQuery);
+            if (!CanCompleteLaunch(launchGeneration, sessionGeneration)) return;
+            if (launched)
+            {
+                HideSpotlight();
+            }
+            else
+            {
+                ShowLaunchFailure(selected);
+            }
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.Error("SPOTLIGHT-LAUNCH", ex, "Launch failed");
+        }
+        finally
+        {
+            if (launchGeneration == _launchGeneration) _launchInFlight = false;
+        }
+    }
+
+    private async void LaunchSelectedElevated()
+    {
+        SpotlightSearchItem? selected = _viewModel.SelectedResult;
+        if (selected == null)
+        {
+            if (!string.IsNullOrWhiteSpace(SearchBox.Text)) PlayShake();
+            return;
+        }
+        if (_launchInFlight) return;
+        if (!SpotlightLauncher.CanLaunchElevated(selected))
+        {
+            // Store apps cannot take the runas verb; a plain launch beats a dead key.
+            LaunchSelected();
+            return;
+        }
+
+        string launchQuery = SearchBox.Text;
+        int launchGeneration = ++_launchGeneration;
+        int sessionGeneration = _animationGeneration;
+        _launchInFlight = true;
+        try
+        {
+            bool cancelled = false;
+            bool launched = await Task.Run(() => _launcher.TryLaunchElevated(selected, out cancelled), CancellationToken.None);
+            // A successful launch can deactivate Spotlight before ShellExecute
+            // returns. Record the captured query even if its UI session closed.
+            if (launched) _viewModel.RecordLaunch(selected, launchQuery);
+            if (!CanCompleteLaunch(launchGeneration, sessionGeneration)) return;
+            if (launched)
+            {
+                HideSpotlight();
+            }
+            else if (!cancelled)
+            {
+                ShowLaunchFailure(selected);
+            }
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.Error("SPOTLIGHT-LAUNCH", ex, "Elevated launch failed");
+        }
+        finally
+        {
+            if (launchGeneration == _launchGeneration) _launchInFlight = false;
+        }
+    }
+
+    private async void RevealSelected()
+    {
+        SpotlightSearchItem? selected = _viewModel.SelectedResult;
+        if (selected == null)
+        {
+            if (!string.IsNullOrWhiteSpace(SearchBox.Text)) PlayShake();
+            return;
+        }
+        if (_launchInFlight || !SpotlightLauncher.CanReveal(selected)) return;
+
+        int launchGeneration = ++_launchGeneration;
+        int sessionGeneration = _animationGeneration;
+        _launchInFlight = true;
+        try
+        {
+            bool revealed = await Task.Run(() => _launcher.TryRevealInExplorer(selected), CancellationToken.None);
+            if (!CanCompleteLaunch(launchGeneration, sessionGeneration)) return;
+            if (revealed) HideSpotlight();
+            else ShowLaunchFailure(selected);
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.Error("SPOTLIGHT-LAUNCH", ex, "Reveal in Explorer failed");
+        }
+        finally
+        {
+            if (launchGeneration == _launchGeneration) _launchInFlight = false;
+        }
+    }
+
+    private bool CanCompleteLaunch(int launchGeneration, int sessionGeneration) =>
+        launchGeneration == _launchGeneration
+        && sessionGeneration == _animationGeneration
+        && IsSpotlightOpen
+        && !_isClosing;
+
+    private void InvalidateLaunchAttempt()
+    {
+        ++_launchGeneration;
+        _launchInFlight = false;
+    }
+
+    private void CopySelected()
+    {
+        SpotlightSearchItem? selected = _viewModel.SelectedResult;
+        string? text = selected == null ? null : SpotlightLauncher.GetCopyableText(selected);
+        if (text == null) return;
+        if (TryCopyToClipboard(text)) HideSpotlight();
+    }
+
+    private static bool TryCopyToClipboard(string text)
+    {
+        try
+        {
+            Clipboard.SetDataObject(text);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.Error("SPOTLIGHT-COPY", ex, "Clipboard write failed");
+            return false;
+        }
+    }
+
+    private void ShowLaunchFailure(SpotlightSearchItem item)
+    {
+        ClearLaunchFailure();
+        // The target is stale (moved or uninstalled); keep Enter useful by
+        _viewModel.RemoveResult(item);
+        ShowSpotlightMessage(Loc.Get("spotlight.launchFailed", item.DisplayTitle));
+    }
+
+    private void ShowSpotlightMessage(string message)
+    {
+        ClearLaunchFailure();
+        FailureText.Text = message;
+        FailureBar.Visibility = Visibility.Visible;
+        PlayShake();
+        int generation = ++_failureGeneration;
+        var timer = new UiScheduledTimer { Interval = FailureDisplayTime };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            timer.Dispose();
+            if (generation != _failureGeneration || !ReferenceEquals(timer, _failureTimer)) return;
+            _failureTimer = null;
+            FailureBar.Visibility = Visibility.Collapsed;
+        };
+        _failureTimer = timer;
+        timer.Start();
+    }
+
+    private void ClearLaunchFailure()
+    {
+        ++_failureGeneration;
+        _failureTimer?.Stop();
+        _failureTimer?.Dispose();
+        _failureTimer = null;
+        if (FailureBar.Visibility != Visibility.Visible) return;
+        FailureBar.Visibility = Visibility.Collapsed;
+    }
+
+    private void PlayShake()
+    {
+        if (AnimationConfig.ReduceMotion) return;
+
+        var now = DateTime.UtcNow;
+        if (now - _lastShakeAtUtc < ShakeCooldown) return;
+        _lastShakeAtUtc = now;
+
+        int shakeGen = ++_shakeGeneration;
+        double[] offsets = [0, -10, 8, -5, 2, 0];
+        var shake = new DoubleAnimationUsingKeyFrames { Duration = TimeSpan.FromMilliseconds(320) };
+        for (int i = 0; i < offsets.Length; i++)
+        {
+            shake.KeyFrames.Add(new LinearDoubleKeyFrame(
+                offsets[i],
+                KeyTime.FromPercent(i / (double)(offsets.Length - 1))));
+        }
+        Timeline.SetDesiredFrameRate(shake, AnimationConfig.TargetFps);
+        shake.Completed += (_, _) =>
+        {
+            if (shakeGen == _shakeGeneration)
+            {
+                ShellShake.BeginAnimation(TranslateTransform.XProperty, null);
+                ShellShake.X = 0;
+            }
+        };
+        ShellShake.BeginAnimation(TranslateTransform.XProperty, shake);
+    }
+
+    private void OnResultsPublished()
+    {
+        SetResultsDimmed(false);
+        if (_viewModel.SelectedResult != null)
+        {
+            // Container generation finishes after layout; defer the scroll so a
+            Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+            {
+                if (_viewModel.SelectedResult != null && ResultsList.IsVisible)
+                    ResultsList.ScrollIntoView(_viewModel.SelectedResult);
+            });
+        }
+        // A publish can move the selected row without a SelectionChanged event.
+        ScheduleGlideUpdate();
+        UpdateAutocomplete();
+
+        if (_pendingLaunchQuery != null
+            && _pendingLaunchQuery == SearchBox.Text)
+        {
+            if (_viewModel.Results.Count > 0)
+            {
+                _pendingLaunchQuery = null;
+                LaunchSelected();
+            }
+            else if (!_viewModel.IsSearching)
+            {
+                _pendingLaunchQuery = null;
+                PlayShake();
+            }
+        }
+        RefreshStatus();
+    }
+
+    private void ResultsList_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+        ScheduleGlideUpdate();
+
+    private void ScheduleGlideUpdate()
+    {
+        // A closing shell resizes every frame; recomputing glide geometry per
+        if (_glideUpdateQueued || _isClosing) return;
+        _glideUpdateQueued = true;
+        // Loaded priority runs after the layout pass, when containers have
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+        {
+            _glideUpdateQueued = false;
+            if (_isClosing) return;
+            UpdateSelectionGlide();
+        });
+    }
+
+    private void UpdateSelectionGlide()
+    {
+        if (!EnsureGlideParts()) return;
+
+        SpotlightSearchItem? selected = _viewModel.SelectedResult;
+        if (selected == null
+            || !ResultsList.IsVisible
+            || ResultsList.ItemContainerGenerator.ContainerFromItem(selected) is not ListBoxItem container
+            || _selectionGlide!.Parent is not UIElement host)
+        {
+            HideSelectionGlide();
+            return;
+        }
+
+        Point position = container.TranslatePoint(new Point(0, 0), host);
+        double width = container.ActualWidth;
+        double height = container.ActualHeight;
+        if (width <= 0 || height <= 0)
+        {
+            HideSelectionGlide();
+            return;
+        }
+
+        _selectionGlide.Width = width;
+        _selectionGlide.Height = height;
+        _glideTransform!.X = position.X;
+
+        if (_glideVisible && !AnimationConfig.ReduceMotion)
+        {
+            // A To-only animation departs from the current animated value, so
+            var glide = new DoubleAnimation(position.Y, TimeSpan.FromMilliseconds(260))
+            {
+                EasingFunction = new ExponentialEase { EasingMode = EasingMode.EaseOut, Exponent = 6 }
+            };
+            Timeline.SetDesiredFrameRate(glide, AnimationConfig.TargetFps);
+            _glideTransform.BeginAnimation(TranslateTransform.YProperty, glide);
+        }
+        else
+        {
+            _glideTransform.BeginAnimation(TranslateTransform.YProperty, null);
+            _glideTransform.Y = position.Y;
+            _selectionGlide.BeginAnimation(OpacityProperty, null);
+            if (AnimationConfig.ReduceMotion)
+            {
+                _selectionGlide.Opacity = 1;
+            }
+            else
+            {
+                var fadeIn = CreateAnimation(0, 1, TimeSpan.FromMilliseconds(140),
+                    new QuadraticEase { EasingMode = EasingMode.EaseOut });
+                _selectionGlide.BeginAnimation(OpacityProperty, fadeIn);
+            }
+        }
+        _glideVisible = true;
+    }
+
+    private void HideSelectionGlide()
+    {
+        if (_selectionGlide == null || !_glideVisible) return;
+        _glideVisible = false;
+        _glideTransform?.BeginAnimation(TranslateTransform.YProperty, null);
+        if (AnimationConfig.ReduceMotion)
+        {
+            _selectionGlide.BeginAnimation(OpacityProperty, null);
+            _selectionGlide.Opacity = 0;
+            return;
+        }
+
+        var fade = CreateAnimation(_selectionGlide.Opacity, 0, TimeSpan.FromMilliseconds(100),
+            new QuadraticEase { EasingMode = EasingMode.EaseOut });
+        _selectionGlide.BeginAnimation(OpacityProperty, fade);
+    }
+
+    private void ResetSelectionGlide()
+    {
+        _glideVisible = false;
+        if (_selectionGlide == null) return;
+        _selectionGlide.BeginAnimation(OpacityProperty, null);
+        _selectionGlide.Opacity = 0;
+        _glideTransform?.BeginAnimation(TranslateTransform.YProperty, null);
+    }
+
+    private bool EnsureGlideParts()
+    {
+        if (_selectionGlide != null && _glideTransform != null) return true;
+        ResultsList.ApplyTemplate();
+        _selectionGlide = ResultsList.Template.FindName("SelectionGlide", ResultsList)
+            as System.Windows.Controls.Border;
+        _glideTransform = ResultsList.Template.FindName("SelectionGlideTransform", ResultsList)
+            as TranslateTransform;
+        return _selectionGlide != null && _glideTransform != null;
+    }
+
+    private void SetResultsDimmed(bool dimmed, bool animate = true)
+    {
+        if (_resultsDimmed == dimmed) return;
+        _resultsDimmed = dimmed;
+        double target = dimmed ? StaleResultsOpacity : 1.0;
+        if (!animate || AnimationConfig.ReduceMotion)
+        {
+            ResultsList.BeginAnimation(OpacityProperty, null);
+            ResultsList.Opacity = target;
+            return;
+        }
+
+        var fade = CreateAnimation(ResultsList.Opacity, target, TimeSpan.FromMilliseconds(120),
+            new QuadraticEase { EasingMode = EasingMode.EaseOut });
+        ResultsList.BeginAnimation(OpacityProperty, fade);
+    }
+
+    private void UpdateAutocomplete()
+    {
+        if (_aiMode) { AutocompleteText.Visibility = Visibility.Collapsed; return; }
+        string query = SearchBox.Text;
+        string? title = _viewModel.Results.Count > 0 ? _viewModel.Results[0].DisplayTitle : null;
+        if (string.IsNullOrEmpty(query)
+            || title == null
+            || title.Length <= query.Length
+            || !title.StartsWith(query, StringComparison.CurrentCultureIgnoreCase))
+        {
+            AutocompleteText.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        // The transparent prefix mirrors what the TextBox displays so the dim
+        AutocompleteTypedRun.Text = query;
+        AutocompleteSuffixRun.Text = title.Substring(query.Length);
+        AutocompleteText.Visibility = Visibility.Visible;
+    }
+
+    private void RefreshStatus()
+    {
+        if (_aiMode) { RefreshAiPanel(); return; }
+        // Instant and deferred providers publish separately. Keep the current
+        // height until the query completes instead of shrinking to partial rows.
+        if (_viewModel.IsSearching && _contentShown && !_entranceActive && !_searchHeightHeld)
+        {
+            double height = ContentRegion.ActualHeight;
+            if (height > 0)
+            {
+                ++_contentHeightAnimationVersion;
+                ContentRegion.BeginAnimation(HeightProperty, null);
+                ContentRegion.Height = height;
+                ContentRegion.ClipToBounds = true;
+                _searchHeightHeld = true;
+                _contentHeightTarget = double.NaN;
+            }
+        }
+        int resultCount = _viewModel.Results.Count;
+        bool hasQuery = !string.IsNullOrWhiteSpace(SearchBox.Text);
+        bool hasResults = resultCount > 0;
+        // Cancellation precedes the input debounce. Keep the existing loading
+        // presentation alive until the replacement query starts.
+        bool searchPending = _viewModel.IsSearching || _searchInputPending;
+
+        // "Searching\u2026" only earns its panel after a grace period; fast queries
+        bool searchingEligible = hasQuery && !hasResults && searchPending;
+        UpdateSearchingGrace(searchingEligible);
+        bool showSearching = searchingEligible && _searchingPanelArmed;
+        // Preserve an existing empty/unavailable message through a short search.
+        // Previously each keystroke collapsed it, then restored the same message.
+        bool retainStatus = searchingEligible && !showSearching
+            && StatusPanel.Visibility == Visibility.Visible;
+        bool showStatus = retainStatus || showSearching
+                          || (hasQuery && !hasResults && !searchPending
+                              && (_viewModel.IsWindowsSearchUnavailable || _viewModel.HasNoResults));
+        bool isSearchingInFlight = hasQuery && searchPending && _contentShown;
+        bool showContent = hasResults || showStatus || isSearchingInFlight;
+
+        // Children first: the reveal/resize animations below measure the
+        if (!_quickActionsOpen) ResultsList.Visibility = (hasResults || (isSearchingInFlight && !showStatus)) ? Visibility.Visible : Visibility.Collapsed;
+        StatusPanel.Visibility = showStatus ? Visibility.Visible : Visibility.Collapsed;
+        if (showStatus && !retainStatus)
+        {
+            string status;
+            if (showSearching)
+            {
+                status = "searching";
+            }
+            else if (_viewModel.IsWindowsSearchUnavailable)
+            {
+                status = "unavailable";
+            }
+            else
+            {
+                status = "noResults";
+            }
+
+            bool isWarning = status == "unavailable";
+            StatusWarningIcon.Visibility = isWarning ? Visibility.Visible : Visibility.Collapsed;
+            StatusGlyph.Visibility = isWarning || showSearching ? Visibility.Collapsed : Visibility.Visible;
+            StatusGlyph.Text = "\uE721";
+            StatusTitle.Text = Loc.Get($"spotlight.{status}");
+            StatusHint.Text = Loc.Get($"spotlight.{status}.hint");
+        }
+        SetSearchActivity(showSearching || (retainStatus && _searchActivityActive));
+
+        bool contentWasShown = _contentShown;
+        SetContentShown(showContent);
+        // A result-count change while the panel is open resizes it smoothly.
+        if (showContent && contentWasShown) ScheduleContentResize();
+        SetEscBadgeVisible(!showContent);
+    }
+
+    private void ScheduleStatusRefresh()
+    {
+        if (_statusRefreshQueued || Dispatcher.HasShutdownStarted) return;
+        _statusRefreshQueued = true;
+
+        // Loaded runs after the current collection notification and its queued
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+        {
+            _statusRefreshQueued = false;
+            if (!Dispatcher.HasShutdownStarted) RefreshStatus();
+        });
+    }
+
+    private void SetContentShown(bool shown)
+    {
+        // While the notch morph locks the shell's height, revealing content
+        if (_entranceActive)
+        {
+            _pendingContentReveal = shown;
+            return;
+        }
+        if (_contentShown == shown) return;
+        _contentShown = shown;
+        _searchHeightHeld = false;
+        _contentHeightTarget = double.NaN;
+        ++_contentHeightAnimationVersion;
+        int generation = ++_contentSizeGeneration;
+
+        if (AnimationConfig.ReduceMotion || (!shown && (!IsSpotlightOpen || _isClosing)))
+        {
+            ContentRegion.BeginAnimation(HeightProperty, null);
+            ContentRegion.BeginAnimation(OpacityProperty, null);
+            ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+            ContentRegion.Height = double.NaN;
+            ContentRegion.Opacity = 1;
+            ContentRegionTranslate.Y = 0;
+            ContentRegion.ClipToBounds = false;
+            ContentRegion.Visibility = shown ? Visibility.Visible : Visibility.Collapsed;
+            return;
+        }
+
+        if (shown)
+        {
+            // Mid-collapse re-shows continue from the current visual height.
+            double from = ContentRegion.Visibility != Visibility.Collapsed
+                ? ContentRegion.ActualHeight
+                : 0;
+            ContentRegion.Visibility = Visibility.Visible;
+            ContentRegion.BeginAnimation(HeightProperty, null);
+            ContentRegion.Height = double.NaN;
+            InvalidateMeasureRecursive(ContentRegion);
+            ContentRegion.Measure(new Size(Math.Max(1, Shell.ActualWidth), double.PositiveInfinity));
+            double targetHeight = ContentRegion.DesiredSize.Height;
+            ContentRegion.Height = from;
+            BeginContentHeightAnimation(from, targetHeight, generation);
+            if (from < 1)
+            {
+                PlayContentReveal();
+            }
+            else
+            {
+                var ease = CreateContentResizeEase();
+                ContentRegion.BeginAnimation(OpacityProperty,
+                    CreateAnimation(ContentRegion.Opacity, 1, TimeSpan.FromMilliseconds(180), ease));
+                ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty,
+                    CreateAnimation(ContentRegionTranslate.Y, 0, TimeSpan.FromMilliseconds(200), ease));
+            }
+        }
+        else
+        {
+            ContentRegion.ClipToBounds = true;
+            var contractEase = CreateContentContractEase();
+            var collapse = CreateAnimation(ContentRegion.ActualHeight, 0,
+                TimeSpan.FromMilliseconds(240),
+                contractEase);
+            var fadeOut = CreateAnimation(ContentRegion.Opacity, 0,
+                TimeSpan.FromMilliseconds(180),
+                contractEase);
+            var slideUp = CreateAnimation(ContentRegionTranslate.Y, -6,
+                TimeSpan.FromMilliseconds(220),
+                contractEase);
+            collapse.Completed += (_, _) =>
+            {
+                if (generation != _contentSizeGeneration) return;
+                ContentRegion.BeginAnimation(HeightProperty, null);
+                ContentRegion.BeginAnimation(OpacityProperty, null);
+                ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+                ContentRegion.Height = double.NaN;
+                ContentRegion.Opacity = 1;
+                ContentRegionTranslate.Y = 0;
+                ContentRegion.ClipToBounds = false;
+                ContentRegion.Visibility = Visibility.Collapsed;
+            };
+            ContentRegion.BeginAnimation(OpacityProperty, fadeOut);
+            ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty, slideUp);
+            ContentRegion.BeginAnimation(HeightProperty, collapse);
+        }
+    }
+
+    private void PrepareEntranceContentReservation()
+    {
+        if (!_entranceActive || !_pendingContentReveal || _contentShown)
+            return;
+
+        // A restored instant query can already have results before the fresh
+        ContentRegion.BeginAnimation(WidthProperty, null);
+        ContentRegion.BeginAnimation(HeightProperty, null);
+        ContentRegion.BeginAnimation(OpacityProperty, null);
+        ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+        ContentRegion.Width = double.NaN;
+        ContentRegion.Height = double.NaN;
+        ContentRegion.HorizontalAlignment = HorizontalAlignment.Stretch;
+        ContentRegion.ClipToBounds = false;
+        ContentRegion.Opacity = 0;
+        ContentRegionTranslate.Y = -6;
+        ContentRegion.Visibility = Visibility.Visible;
+        ContentRegion.UpdateLayout();
+
+        double reservedWidth = ContentRegion.ActualWidth;
+        double reservedHeight = ContentRegion.ActualHeight;
+        if (!double.IsFinite(reservedWidth) || reservedWidth <= 0
+            || !double.IsFinite(reservedHeight) || reservedHeight <= 0)
+        {
+            ContentRegion.Opacity = 1;
+            ContentRegionTranslate.Y = 0;
+            ContentRegion.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        ++_contentSizeGeneration;
+        _entranceContentReserved = true;
+        ContentRegion.Width = reservedWidth;
+        ContentRegion.Height = reservedHeight;
+        ContentRegion.HorizontalAlignment = HorizontalAlignment.Left;
+        ContentRegion.ClipToBounds = true;
+        // The outer ShellContent fade reveals this reserved layout during morph.
+        ContentRegion.Opacity = 1;
+        ContentRegionTranslate.Y = 0;
+        ContentRegion.Visibility = Visibility.Visible;
+
+        RuntimeLog.Debug(
+            "SPOTLIGHT-MORPH",
+            $"Entrance content reserve: {reservedWidth:F1}x{reservedHeight:F1}, " +
+            $"sourcePending={_pendingContentReveal}, gen={_animationGeneration}");
+    }
+
+    private bool RevealEntranceContentReservation()
+    {
+        if (!_entranceContentReserved) return false;
+        bool alreadyVisible = ContentRegion.Visibility == Visibility.Visible;
+
+        double reservedHeight = ContentRegion.Height;
+        if (!double.IsFinite(reservedHeight) || reservedHeight <= 0)
+            reservedHeight = Math.Max(1, ContentRegion.ActualHeight);
+        double landedShellHeight = Math.Max(1, Shell.ActualHeight);
+
+        _entranceContentReserved = false;
+        _contentShown = true;
+        int generation = ++_contentSizeGeneration;
+
+        // Make the frozen region renderable while it is still transparent,
+        Shell.Height = landedShellHeight;
+        ContentRegion.BeginAnimation(WidthProperty, null);
+        ContentRegion.BeginAnimation(HeightProperty, null);
+        ContentRegion.BeginAnimation(OpacityProperty, null);
+        ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+        ContentRegion.Opacity = alreadyVisible ? 1 : 0;
+        ContentRegionTranslate.Y = alreadyVisible ? 0 : -6;
+        ContentRegion.Visibility = Visibility.Visible;
+        ContentRegion.Width = double.NaN;
+        ContentRegion.Height = double.NaN;
+        ContentRegion.HorizontalAlignment = HorizontalAlignment.Stretch;
+        ContentRegion.ClipToBounds = true;
+        double availableWidth = Math.Max(1, Shell.ActualWidth
+            - Shell.BorderThickness.Left - Shell.BorderThickness.Right);
+        InvalidateMeasureRecursive(ContentRegion);
+        ContentRegion.Measure(new Size(availableWidth, double.PositiveInfinity));
+        double naturalHeight = ContentRegion.DesiredSize.Height;
+        if (!double.IsFinite(naturalHeight) || naturalHeight <= 0)
+            naturalHeight = reservedHeight;
+
+        // Restore the reservation before releasing the shell back to auto
+        ContentRegion.Height = reservedHeight;
+        ContentRegion.UpdateLayout();
+        Shell.Height = double.NaN;
+        if (Math.Abs(naturalHeight - reservedHeight) <= 1)
+        {
+            ContentRegion.Height = double.NaN;
+            ContentRegion.ClipToBounds = false;
+        }
+        else
+        {
+            BeginContentHeightAnimation(reservedHeight, naturalHeight, generation);
+        }
+
+        if (!alreadyVisible) PlayContentReveal();
+        ScheduleGlideUpdate();
+        return true;
+    }
+
+    private void ClearEntranceContentReservation()
+    {
+        if (!_entranceContentReserved) return;
+
+        _entranceContentReserved = false;
+        int generation = ++_contentSizeGeneration;
+        double from = ContentRegion.Height;
+        if (!double.IsFinite(from) || from <= 0)
+            from = Math.Max(1, ContentRegion.ActualHeight);
+
+        // The query may have been cleared while the reserved entrance was in
+        ContentRegion.Visibility = Visibility.Hidden;
+        ContentRegion.ClipToBounds = true;
+        if (!IsSpotlightOpen || AnimationConfig.ReduceMotion)
+        {
+            ContentRegion.BeginAnimation(WidthProperty, null);
+            ContentRegion.BeginAnimation(HeightProperty, null);
+            ContentRegion.Width = double.NaN;
+            ContentRegion.Height = double.NaN;
+            ContentRegion.HorizontalAlignment = HorizontalAlignment.Stretch;
+            ContentRegion.Opacity = 1;
+            ContentRegionTranslate.Y = 0;
+            ContentRegion.ClipToBounds = false;
+            ContentRegion.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        var collapse = CreateAnimation(from, 0, TimeSpan.FromMilliseconds(240),
+            CreateContentContractEase());
+        collapse.Completed += (_, _) =>
+        {
+            if (generation != _contentSizeGeneration) return;
+            ContentRegion.BeginAnimation(WidthProperty, null);
+            ContentRegion.BeginAnimation(HeightProperty, null);
+            ContentRegion.Width = double.NaN;
+            ContentRegion.Height = double.NaN;
+            ContentRegion.HorizontalAlignment = HorizontalAlignment.Stretch;
+            ContentRegion.Opacity = 1;
+            ContentRegionTranslate.Y = 0;
+            ContentRegion.ClipToBounds = false;
+            ContentRegion.Visibility = Visibility.Collapsed;
+        };
+        ContentRegion.BeginAnimation(HeightProperty, collapse);
+    }
+
+    private void ScheduleContentResize()
+    {
+        if (_contentResizeQueued || _entranceActive) return;
+        _contentResizeQueued = true;
+        int generation = _contentSizeGeneration;
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+        {
+            _contentResizeQueued = false;
+            if (generation != _contentSizeGeneration || !_contentShown || _entranceActive) return;
+            bool searchPending = _viewModel.IsSearching || _searchInputPending;
+            // Measure the child without releasing the visible border to Auto:
+            // UpdateLayout on the border would snap it before animating back.
+            double oldHeight = ContentRegion.ActualHeight;
+            double target = MeasureTargetContentHeight();
+            if (!double.IsFinite(target)) return;
+            // Keep partial results steady, but size a waiting message to its
+            // own content instead of retaining an empty results viewport.
+            if (searchPending && StatusPanel.Visibility != Visibility.Visible && target <= oldHeight + 1) return;
+            if (Math.Abs(target - _contentHeightTarget) < 1)
+            {
+                if (!searchPending && _searchHeightHeld)
+                {
+                    _searchHeightHeld = false;
+                    if (Math.Abs(target - oldHeight) < 1)
+                    {
+                        ++_contentHeightAnimationVersion;
+                        ContentRegion.BeginAnimation(HeightProperty, null);
+                        ContentRegion.Height = double.NaN;
+                        ContentRegion.ClipToBounds = false;
+                    }
+                }
+                return;
+            }
+            _searchHeightHeld = searchPending;
+            if (AnimationConfig.ReduceMotion || Math.Abs(target - oldHeight) < 1)
+            {
+                ++_contentHeightAnimationVersion;
+                _contentHeightTarget = target;
+                ContentRegion.BeginAnimation(HeightProperty, null);
+                ContentRegion.Height = searchPending ? target : double.NaN;
+                ContentRegion.ClipToBounds = searchPending;
+                return;
+            }
+            BeginContentHeightAnimation(oldHeight, target, generation);
+        });
+    }
+
+    private void BeginContentHeightAnimation(double from, double to, int generation)
+    {
+        long version = ++_contentHeightAnimationVersion;
+        // A new query must not cancel a reveal and freeze its intermediate frame.
+        _searchHeightHeld = !_aiMode && (_viewModel.IsSearching || _searchInputPending);
+        _contentHeightTarget = to;
+        ContentRegion.ClipToBounds = true;
+        // The lower edge leads; text stays at its natural size as it is revealed.
+        var resize = CreateAnimation(from, to, TimeSpan.FromMilliseconds(to >= from ? 310 : 280),
+            to >= from ? CreateContentResizeEase() : CreateContentContractEase());
+        resize.Completed += (_, _) =>
+        {
+            if (generation != _contentSizeGeneration || version != _contentHeightAnimationVersion) return;
+            // Keep the fully revealed height until deferred providers finish;
+            // releasing to Auto earlier can shrink to a partial result batch.
+            bool holdHeight = !_aiMode && (_viewModel.IsSearching || _searchInputPending);
+            _searchHeightHeld = holdHeight;
+            ContentRegion.BeginAnimation(HeightProperty, null);
+            ContentRegion.Height = holdHeight ? to : double.NaN;
+            ContentRegion.ClipToBounds = holdHeight;
+        };
+        ContentRegion.BeginAnimation(HeightProperty, resize);
+    }
+
+    private void ResetContentRegion()
+    {
+        ++_contentHeightAnimationVersion;
+        _searchHeightHeld = false;
+        _contentHeightTarget = double.NaN;
+        ++_contentSizeGeneration;
+        _contentShown = false;
+        _entranceContentReserved = false;
+        _contentResizeQueued = false;
+        ContentRegion.BeginAnimation(WidthProperty, null);
+        ContentRegion.BeginAnimation(HeightProperty, null);
+        ContentRegion.BeginAnimation(OpacityProperty, null);
+        ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+        ContentRegion.Width = double.NaN;
+        ContentRegion.Height = double.NaN;
+        ContentRegion.HorizontalAlignment = HorizontalAlignment.Stretch;
+        ContentRegion.Opacity = 1;
+        ContentRegionTranslate.Y = 0;
+        ContentRegion.ClipToBounds = false;
+        ContentRegion.Visibility = Visibility.Collapsed;
+    }
+
+    private void UpdateSearchingGrace(bool searchingEligible)
+    {
+        if (!searchingEligible)
+        {
+            CancelSearchingGrace();
+            return;
+        }
+
+        if (_searchingPanelArmed || _searchingGraceTimer?.IsEnabled == true) return;
+        int generation = ++_searchingGraceGeneration;
+        int sessionGeneration = _animationGeneration;
+        string query = SearchBox.Text;
+        var timer = new UiScheduledTimer { Interval = SearchingPanelGrace };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            timer.Dispose();
+            if (generation != _searchingGraceGeneration
+                || !ReferenceEquals(timer, _searchingGraceTimer))
+            {
+                return;
+            }
+            _searchingGraceTimer = null;
+            if (sessionGeneration != _animationGeneration
+                || !IsSpotlightOpen
+                || _isClosing
+                || SearchBox.Text != query
+                || !_viewModel.IsSearching
+                || _viewModel.Results.Count != 0)
+            {
+                return;
+            }
+            _searchingPanelArmed = true;
+            RefreshStatus();
+        };
+        _searchingGraceTimer = timer;
+        timer.Start();
+    }
+
+    private void CancelSearchingGrace()
+    {
+        ++_searchingGraceGeneration;
+        _searchingGraceTimer?.Stop();
+        _searchingGraceTimer?.Dispose();
+        _searchingGraceTimer = null;
+        _searchingPanelArmed = false;
+    }
+
+    private void SetEscBadgeVisible(bool visible)
+    {
+        if (_escBadgeVisible == visible) return;
+        _escBadgeVisible = visible;
+        double target = visible ? 1 : 0;
+        if (AnimationConfig.ReduceMotion)
+        {
+            EscBadge.BeginAnimation(OpacityProperty, null);
+            EscBadge.Opacity = target;
+            return;
+        }
+
+        var fade = CreateAnimation(EscBadge.Opacity, target, TimeSpan.FromMilliseconds(140),
+            new QuadraticEase { EasingMode = EasingMode.EaseOut });
+        EscBadge.BeginAnimation(OpacityProperty, fade);
+    }
+
+    private static IEasingFunction CreateContentResizeEase() =>
+        CubicBezierEase.FromEaseOutCurve(0.22, 0.88, 0.28, 1.0);
+
+    private static IEasingFunction CreateContentContractEase() =>
+        CubicBezierEase.FromEaseOutCurve(0.26, 0.82, 0.28, 1.0);
+
+    private void PlayContentReveal()
+    {
+        ContentRegion.BeginAnimation(OpacityProperty, null);
+        ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+        ContentRegion.Opacity = 1;
+        ContentRegionTranslate.Y = 0;
+        if (AnimationConfig.ReduceMotion) return;
+
+        var ease = CreateContentResizeEase();
+        var fade = CreateAnimation(0, 1, TimeSpan.FromMilliseconds(220), ease);
+        var slide = CreateAnimation(-8, 0, TimeSpan.FromMilliseconds(250), ease);
+        fade.FillBehavior = FillBehavior.Stop;
+        slide.FillBehavior = FillBehavior.Stop;
+        ContentRegion.BeginAnimation(OpacityProperty, fade);
+        ContentRegionTranslate.BeginAnimation(TranslateTransform.YProperty, slide);
+
+        if (!_quickActionsOpen && ResultsList.Visibility == Visibility.Visible)
+        {
+            ResultsListTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+            ResultsListTranslate.Y = 0;
+            var listSlide = CreateAnimation(-6, 0, TimeSpan.FromMilliseconds(240), ease);
+            listSlide.FillBehavior = FillBehavior.Stop;
+            ResultsListTranslate.BeginAnimation(TranslateTransform.YProperty, listSlide);
+        }
+    }
+
+    private (double Left, double Top) GetSpotlightTarget()
+    {
+        POINT point;
+        if (!GetCursorPos(out point))
+        {
+            point = default;
+        }
+
+        IntPtr monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        var info = new MONITORINFO { cbSize = System.Runtime.InteropServices.Marshal.SizeOf<MONITORINFO>() };
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info))
+        {
+            Rect workArea = SystemParameters.WorkArea;
+            return (workArea.Left + (workArea.Width - Width) / 2.0,
+                workArea.Top + Math.Max(72, workArea.Height * 0.18) - Shell.Margin.Top);
+        }
+
+        double scale = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, out uint dpiX, out _) == 0
+            ? dpiX / 96.0
+            : 1.0;
+        int width = (int)Math.Round(Width * scale);
+        int left = info.rcWork.Left + (info.rcWork.Right - info.rcWork.Left - width) / 2;
+        int top = info.rcWork.Top + Math.Max((int)Math.Round(72 * scale),
+            (int)Math.Round((info.rcWork.Bottom - info.rcWork.Top) * 0.18));
+        return (left / scale, top / scale - Shell.Margin.Top);
+    }
+
+    private Action PrepareEntrance(double finalLeft, double finalTop, int generation)
+    {
+        if (AnimationConfig.ReduceMotion)
+        {
+            AnimateGlassReadability(true, animate: false);
+            ResetNotchMorphSnapshot();
+            Left = finalLeft;
+            Top = finalTop;
+            Shell.Opacity = 1;
+            Shell.Visibility = Visibility.Visible;
+            ShellScale.ScaleX = ShellScale.ScaleY = 1;
+            ShellCornerRadius = ExpandedCornerRadius;
+            ShellTopCornerRadius = ExpandedCornerRadius;
+            ShellContent.Opacity = 1;
+            ContentTranslate.Y = 0;
+            RestoreShadow();
+            // Commit the final no-motion frame before handing source visibility
+            return () => SetNotchMorphActive(true);
+        }
+
+        _entranceActive = true;
+        var morphEase = CreateMorphEase();
+        var contentEase = new ExponentialEase { EasingMode = EasingMode.EaseOut, Exponent = 6 };
+
+        double startLeft = finalLeft;
+        double startTop = finalTop;
+        var finalShellSize = MeasureEntranceShell();
+        double finalShellWidth = finalShellSize.Width;
+        double finalShellHeight = finalShellSize.Height;
+        double startShellWidth = finalShellWidth * 0.97;
+        double startShellHeight = finalShellHeight * 0.82;
+        double startTopRadius = 10;
+        double startBottomRadius = 10;
+        bool morphsFromNotch = TryGetNotchRect(out var notch);
+        if (morphsFromNotch)
+        {
+            startShellWidth = notch.Width;
+            startShellHeight = notch.Height;
+            startTopRadius = Math.Max(0, notch.TopCornerRadius);
+            startBottomRadius = Math.Max(0, notch.BottomCornerRadius);
+            startLeft = notch.Left + notch.Width / 2.0 - ActualWidth / 2.0;
+            startTop = notch.Top - Shell.Margin.Top;
+        }
+        bool hasNotchSnapshot = morphsFromNotch
+            && !IsLiquidGlassEnabled
+            && PrepareNotchMorphSnapshot();
+
+        Shell.RenderTransformOrigin = new Point(0.5, 0.0);
+        Shell.CacheMode = null;
+        ShellContent.CacheMode = null;
+        Shell.Margin = MorphShellMargin;
+        Shell.HorizontalAlignment = HorizontalAlignment.Center;
+        Shell.VerticalAlignment = VerticalAlignment.Top;
+        if (morphsFromNotch)
+        {
+            SetMorphShadow();
+            SolidColorBrush border = EnsureShellBorderBrush();
+            border.BeginAnimation(Brush.OpacityProperty, null);
+            border.Opacity = 0;
+        }
+        else
+        {
+            SetMorphShadow();
+        }
+
+        // Seed bases from the first rendered frame. WPF does not apply a new
+        Left = startLeft;
+        Top = startTop;
+        Shell.Opacity = 1;
+        // If capture failed, leave the real source unobscured until the render
+        Shell.Visibility = !morphsFromNotch || hasNotchSnapshot || IsLiquidGlassEnabled
+            ? Visibility.Visible
+            : Visibility.Hidden;
+        ShellScale.ScaleX = 1;
+        ShellScale.ScaleY = 1;
+        Shell.Width = startShellWidth;
+        Shell.Height = startShellHeight;
+        ShellCornerRadius = startBottomRadius;
+        ShellTopCornerRadius = startTopRadius;
+        if (IsLiquidGlassEnabled)
+        {
+            NotchMorphSnapshot.Visibility = Visibility.Collapsed;
+            NotchMorphSnapshot.Opacity = 0;
+            if (ShellLeftEar != null) { ShellLeftEar.Opacity = 0; ShellLeftEar.Visibility = Visibility.Collapsed; }
+            if (ShellRightEar != null) { ShellRightEar.Opacity = 0; ShellRightEar.Visibility = Visibility.Collapsed; }
+        }
+        ShellContent.Opacity = 0;
+        ContentTranslate.Y = 8;
+        // Keep text laid out at its destination width while the shell expands.
+        // An effect on this subtree also changes text rasterization at handoff.
+        ShellContent.Width = Math.Max(1, finalShellWidth
+            - Shell.BorderThickness.Left - Shell.BorderThickness.Right);
+        ShellContent.HorizontalAlignment = HorizontalAlignment.Left;
+        ShellContent.Effect = null;
+
+        var expandWidth = CreateAnimation(startShellWidth, finalShellWidth,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var expandHeight = CreateAnimation(startShellHeight, finalShellHeight,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var moveLeft = CreateAnimation(startLeft, finalLeft, MorphDuration, morphEase, synchronizedMorph: true);
+        var moveTop = CreateAnimation(startTop, finalTop, MorphDuration, morphEase, synchronizedMorph: true);
+        var corner = CreateAnimation(startBottomRadius, ExpandedCornerRadius, MorphDuration, morphEase, synchronizedMorph: true);
+        var cornerTop = CreateAnimation(startTopRadius, ExpandedCornerRadius, MorphDuration, morphEase, synchronizedMorph: true);
+
+        var contentFade = CreateAnimation(0, 1, TimeSpan.FromMilliseconds(300), contentEase);
+        // The captured notch covers the short content delay. If capture is not
+        double contentDelayMs = morphsFromNotch && !hasNotchSnapshot ? 0 : 60;
+        contentFade.BeginTime = TimeSpan.FromMilliseconds(contentDelayMs);
+        var contentSlide = CreateAnimation(8, 0, TimeSpan.FromMilliseconds(340), contentEase);
+        contentSlide.BeginTime = contentFade.BeginTime;
+        DoubleAnimation? notchFade = hasNotchSnapshot
+            ? CreateAnimation(1, 0, TimeSpan.FromMilliseconds(260),
+                new CubicEase { EasingMode = EasingMode.EaseInOut })
+            : null;
+
+        return () =>
+        {
+            if (generation != _animationGeneration || _isClosing || !IsSpotlightOpen) return;
+
+            AnimateGlassReadability(true);
+            if (IsLiquidGlassEnabled)
+            {
+                CompositionTarget.Rendering -= OnLiquidGlassFrameUpdate;
+                CompositionTarget.Rendering += OnLiquidGlassFrameUpdate;
+            }
+            _liquidGlass?.SetIdle(false);
+            _liquidGlass?.SetAnimating(true);
+            Shell.Visibility = Visibility.Visible;
+            if (morphsFromNotch)
+            {
+                AnimateMorphShadow();
+            }
+            else
+            {
+                RestoreShadow();
+            }
+
+            expandWidth.Completed += (_, _) =>
+            {
+                if (generation != _animationGeneration || _isClosing || !IsSpotlightOpen) return;
+                CompleteEntrance(finalLeft, finalTop);
+            };
+
+            Shell.BeginAnimation(WidthProperty, expandWidth);
+            Shell.BeginAnimation(HeightProperty, expandHeight);
+            BeginAnimation(LeftProperty, moveLeft);
+            BeginAnimation(TopProperty, moveTop);
+            BeginAnimation(ShellCornerRadiusProperty, corner);
+            BeginAnimation(ShellTopCornerRadiusProperty, cornerTop);
+            ShellContent.BeginAnimation(OpacityProperty, contentFade);
+            ContentTranslate.BeginAnimation(TranslateTransform.YProperty, contentSlide);
+            if (notchFade != null)
+                NotchMorphSnapshot.BeginAnimation(OpacityProperty, notchFade);
+            // The notch has no light outline; the border only belongs to the
+            if (morphsFromNotch) AnimateShellBorder(0, 1, MorphDuration);
+            if (morphsFromNotch) SetNotchMorphActive(true);
+        };
+    }
+
+    private void ReverseExitToEntrance()
+    {
+        PlaySpotlightClickSfx();
+        int generation = ++_animationGeneration;
+        MorphSnapshot current = FreezeCurrentMorphState();
+        var target = GetSpotlightTarget();
+
+        // PlayExit froze the results region into a fixed clipped box (and
+        if (!_entranceContentReserved)
+        {
+            ++_contentSizeGeneration;
+            ContentRegion.BeginAnimation(HeightProperty, null);
+            ContentRegion.Width = double.NaN;
+            ContentRegion.Height = double.NaN;
+            ContentRegion.HorizontalAlignment = HorizontalAlignment.Stretch;
+            ContentRegion.ClipToBounds = false;
+            if (_contentShown) ContentRegion.Visibility = Visibility.Visible;
+        }
+
+        // Measure the expanded auto-height without exposing an intermediate
+        Shell.Width = double.NaN;
+        Shell.Height = double.NaN;
+        Size finalSize = MeasureEntranceShell();
+
+        _isClosing = false;
+        _entranceActive = true;
+        _lastDismissedQuery = null;
+        SearchBox.IsEnabled = true;
+        SetResultsDimmed(false, animate: false);
+        ApplyLiquidGlassSkin();
+        UpdateAiAmbientGlow(_aiMode);
+        AnimateGlassReadability(true);
+        _liquidGlass?.SetAnimating(true);
+
+        Shell.RenderTransformOrigin = new Point(0.5, 0.0);
+        Shell.CacheMode = null;
+        ShellContent.CacheMode = null;
+        Shell.Margin = MorphShellMargin;
+        Shell.HorizontalAlignment = HorizontalAlignment.Center;
+        Shell.VerticalAlignment = VerticalAlignment.Top;
+        ResetNotchMorphSnapshot();
+        AnimateMorphShadow();
+
+        // Keep the exact interrupted presentation as the base until the first
+        Left = current.Left;
+        Top = current.Top;
+        Shell.Opacity = current.ShellOpacity;
+        Shell.Visibility = Visibility.Visible;
+        ShellScale.ScaleX = ShellScale.ScaleY = 1;
+        Shell.Width = current.Width;
+        Shell.Height = current.Height;
+        ShellCornerRadius = current.CornerRadius;
+        ShellTopCornerRadius = current.TopCornerRadius;
+        ShellContent.Opacity = current.ContentOpacity;
+        double currentEarOpacity = ShellLeftEar?.Opacity ?? 0;
+        AnimateMorphEars(currentEarOpacity, 0, TimeSpan.FromMilliseconds(200), TimeSpan.Zero);
+        ContentTranslate.Y = current.ContentTranslateY;
+        ShellContent.Width = Math.Max(1, finalSize.Width
+            - Shell.BorderThickness.Left - Shell.BorderThickness.Right);
+        ShellContent.HorizontalAlignment = HorizontalAlignment.Left;
+        ShellContent.Effect = null;
+
+        var morphEase = CreateMorphEase();
+        var contentEase = new ExponentialEase { EasingMode = EasingMode.EaseOut, Exponent = 6 };
+        var expandWidth = CreateAnimation(current.Width, finalSize.Width,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var expandHeight = CreateAnimation(current.Height, finalSize.Height,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var moveLeft = CreateAnimation(current.Left, target.Left,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var moveTop = CreateAnimation(current.Top, target.Top,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var corner = CreateAnimation(current.CornerRadius, ExpandedCornerRadius,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var cornerTop = CreateAnimation(current.TopCornerRadius, ExpandedCornerRadius,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var shellReveal = CreateAnimation(current.ShellOpacity, 1,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var contentFade = CreateAnimation(current.ContentOpacity, 1,
+            TimeSpan.FromMilliseconds(240), contentEase);
+        var contentSlide = CreateAnimation(current.ContentTranslateY, 0,
+            TimeSpan.FromMilliseconds(280), contentEase);
+
+        expandWidth.Completed += (_, _) =>
+        {
+            if (generation != _animationGeneration || _isClosing || !IsSpotlightOpen) return;
+            CompleteEntrance(target.Left, target.Top);
+        };
+
+        Shell.BeginAnimation(WidthProperty, expandWidth);
+        Shell.BeginAnimation(HeightProperty, expandHeight);
+        BeginAnimation(LeftProperty, moveLeft);
+        BeginAnimation(TopProperty, moveTop);
+        BeginAnimation(ShellCornerRadiusProperty, corner);
+        BeginAnimation(ShellTopCornerRadiusProperty, cornerTop);
+        Shell.BeginAnimation(OpacityProperty, shellReveal);
+        ShellContent.BeginAnimation(OpacityProperty, contentFade);
+        ContentTranslate.BeginAnimation(TranslateTransform.YProperty, contentSlide);
+        AnimateShellBorder(current.BorderOpacity, 1, MorphDuration);
+        SetNotchMorphActive(true);
+
+        string query = SearchBox.Text;
+        if (!_aiMode && !string.IsNullOrWhiteSpace(query)) _ = _viewModel.SearchAsync(query);
+        FocusSearchBox(generation);
+    }
+
+    // The resting search surface remains 720 DIPs wide inside the wider HWND.
+    // Explicit morph widths need the full canvas, including the 920-DIP tray.
+    private static readonly Thickness RestingShellMargin = new(124, 16, 124, 0);
+    private static readonly Thickness MorphShellMargin = new(24, 16, 24, 0);
+
+    private Size MeasureEntranceShell()
+    {
+        RestoreShellContentLayout();
+        Shell.Margin = RestingShellMargin;
+        // Include the resting border in the target and keep it during the morph.
+        // Adding it only at handoff grows the auto-height shell by two DIPs.
+        Shell.BorderThickness = new Thickness(IsLiquidGlassEnabled ? 0 : 1);
+        // ActualSize can still describe the final notch-sized frame when a
+        double width = SpotlightLayoutMetrics.ResolveMeasureWidth(ActualWidth, Width);
+
+        Shell.Measure(new Size(width, double.PositiveInfinity));
+        var size = SpotlightLayoutMetrics.CalculateEntranceSize(
+            width, Shell.DesiredSize.Height, Shell.ActualHeight, Shell.Margin);
+
+        RuntimeLog.Debug(
+            "SPOTLIGHT-MORPH",
+            $"Entrance measure: target={size.Width:F1}x{size.Height:F1}, actual={Shell.ActualWidth:F1}x{Shell.ActualHeight:F1}, gen={_animationGeneration}");
+        return size;
+    }
+
+    private void PlayExit(int generation)
+    {
+        if (_settings.EnableDynamicIslandMode)
+        {
+            // Spotlight's decorative rims do not belong to the destination pill.
+            // The shell border fade alone does not affect these separate layers.
+            SetOpticalRimVisibility(Visibility.Collapsed);
+            AiGlowBorder.BeginAnimation(OpacityProperty, null);
+            AiGlowEffect.BeginAnimation(DropShadowEffect.BlurRadiusProperty, null);
+            AiGlowBorder.Opacity = 0;
+            AiGlowBorder.Visibility = Visibility.Collapsed;
+        }
+        AnimateGlassReadability(false);
+        if (IsLiquidGlassEnabled && GlassMaterialClipHost.Visibility == Visibility.Visible)
+        {
+            // The temporary opening fallback must never travel back to the
+            // notch as an opaque panel if the first glass frame was delayed.
+            Shell.Background = Brushes.Transparent;
+            CompositionTarget.Rendering -= OnLiquidGlassFrameUpdate;
+            CompositionTarget.Rendering += OnLiquidGlassFrameUpdate;
+        }
+        UpdateGlassCaptureExtent();
+        _liquidGlass?.SetIdle(false);
+        _liquidGlass?.SetAnimating(true);
+        if (AnimationConfig.ReduceMotion)
+        {
+            CompleteHide();
+            return;
+        }
+
+        if (!TryGetNotchRect(out var notch))
+        {
+            double fromOpacity = Math.Clamp(Shell.Opacity, 0, 1);
+            Shell.Opacity = fromOpacity;
+            var fade = CreateAnimation(fromOpacity, 0, TimeSpan.FromMilliseconds(120),
+                new QuadraticEase { EasingMode = EasingMode.EaseIn });
+            fade.Completed += (_, _) =>
+            {
+                if (generation == _animationGeneration) CompleteHide();
+            };
+            Shell.BeginAnimation(OpacityProperty, fade);
+            return;
+        }
+
+        MorphSnapshot current = FreezeCurrentMorphState();
+        var morphEase = CreateMorphEase();
+        var contentEase = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+        Shell.RenderTransformOrigin = new Point(0.5, 0.0);
+        Shell.CacheMode = null;
+        ShellContent.CacheMode = new BitmapCache { EnableClearType = false, SnapsToDevicePixels = true };
+        Shell.Margin = MorphShellMargin;
+        Shell.HorizontalAlignment = HorizontalAlignment.Center;
+        Shell.VerticalAlignment = VerticalAlignment.Top;
+        AnimateMorphShadow();
+
+        double targetWidth = Math.Max(1, notch.Width);
+        double targetHeight = Math.Max(1, notch.Height);
+        double targetBottomRadius = Math.Max(0, notch.BottomCornerRadius);
+        double targetTopRadius = Math.Max(0, notch.TopCornerRadius);
+        double targetLeft = notch.Left + notch.Width / 2.0 - ActualWidth / 2.0;
+        double targetTop = notch.Top - Shell.Margin.Top;
+
+        // Preserve the live presentation as the replacement clock's base. The
+        Left = current.Left;
+        Top = current.Top;
+        ShellScale.ScaleX = 1;
+        ShellScale.ScaleY = 1;
+        Shell.Opacity = current.ShellOpacity;
+        Shell.Width = current.Width;
+        Shell.Height = current.Height;
+        ShellCornerRadius = current.CornerRadius;
+        ShellTopCornerRadius = current.TopCornerRadius;
+        Shell.BorderThickness = new Thickness(0);
+        ShellContent.Opacity = current.ContentOpacity;
+        ContentTranslate.Y = current.ContentTranslateY;
+        var contentBlur = EnsureContentBlurEffect();
+        contentBlur.Radius = current.ContentBlurRadius;
+
+        // Freeze content layout while the surrounding shell contracts.
+        ShellContent.Width = Math.Max(1, ShellContent.ActualWidth);
+        ShellContent.HorizontalAlignment = HorizontalAlignment.Left;
+
+        bool hadVisibleContent = ContentRegion.Visibility == Visibility.Visible;
+        if (hadVisibleContent)
+        {
+            ++_contentSizeGeneration;
+            ContentRegion.BeginAnimation(HeightProperty, null);
+            ContentRegion.Width = Math.Max(1, ContentRegion.ActualWidth);
+            ContentRegion.Height = Math.Max(1, ContentRegion.ActualHeight);
+            ContentRegion.HorizontalAlignment = HorizontalAlignment.Left;
+            ContentRegion.ClipToBounds = true;
+        }
+
+        var shrinkWidth = CreateAnimation(current.Width, targetWidth,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var shrinkHeight = CreateAnimation(current.Height, targetHeight,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var moveLeft = CreateAnimation(current.Left, targetLeft, MorphDuration, morphEase, synchronizedMorph: true);
+        var moveTop = CreateAnimation(current.Top, targetTop, MorphDuration, morphEase, synchronizedMorph: true);
+        var corner = CreateAnimation(current.CornerRadius, targetBottomRadius, MorphDuration, morphEase, synchronizedMorph: true);
+        var cornerTop = CreateAnimation(current.TopCornerRadius, targetTopRadius, MorphDuration, morphEase, synchronizedMorph: true);
+        var shellNormalize = CreateAnimation(current.ShellOpacity, 1,
+            MorphDuration, morphEase, synchronizedMorph: true);
+        var contentFade = CreateAnimation(current.ContentOpacity, 0,
+            TimeSpan.FromMilliseconds(170), contentEase);
+        var contentSlide = CreateAnimation(current.ContentTranslateY, 0,
+            TimeSpan.FromMilliseconds(210), contentEase);
+
+        if (hadVisibleContent) contentFade.Completed += (_, _) =>
+        {
+            if (generation != _animationGeneration || !_isClosing) return;
+            // The content is invisible from here on; dropping the frozen
+            ContentRegion.Visibility = Visibility.Collapsed;
+        };
+        shrinkWidth.Completed += (_, _) =>
+        {
+            if (generation == _animationGeneration) BeginReturnHandoff(generation);
+        };
+
+        Shell.BeginAnimation(WidthProperty, shrinkWidth);
+        Shell.BeginAnimation(HeightProperty, shrinkHeight);
+        BeginAnimation(LeftProperty, moveLeft);
+        BeginAnimation(TopProperty, moveTop);
+        BeginAnimation(ShellCornerRadiusProperty, corner);
+        BeginAnimation(ShellTopCornerRadiusProperty, cornerTop);
+        Shell.BeginAnimation(OpacityProperty, shellNormalize);
+        ShellContent.BeginAnimation(OpacityProperty, contentFade);
+        ContentTranslate.BeginAnimation(TranslateTransform.YProperty, contentSlide);
+        // Fade exit content without extra blur pulse and shed outline early so shell
+        // matches destination geometry at handoff.
+        AnimateShellBorder(current.BorderOpacity, 0, TimeSpan.FromMilliseconds(200));
+
+        if (!IsLiquidGlassEnabled && targetTopRadius == 0)
+            AnimateMorphEars(0, 1, TimeSpan.FromMilliseconds(260), TimeSpan.FromMilliseconds(260));
+        else
+            AnimateMorphEars(0, 0, TimeSpan.Zero, TimeSpan.Zero);
+    }
+
+    private void BeginReturnHandoff(int generation)
+    {
+        if (generation != _animationGeneration || !IsSpotlightOpen) return;
+        var handoffDuration = TimeSpan.FromMilliseconds(500);
+        FreezeCurrentMorphState();
+
+        if (IsLiquidGlassEnabled && GlassMaterialClipHost.Visibility == Visibility.Visible)
+        {
+            // Readability dimming belongs only to the open Spotlight. Retire
+            // its clock before revealing notch content underneath this shell.
+            AnimateGlassReadability(false, animate: false);
+            Shell.Background = Brushes.Transparent;
+        }
+
+        // Retire the morph shell in the same dispatcher turn that restores the notch.
+        Shell.Opacity = 0;
+        // ClearMorphAnimations restored the border's base opacity; the shell
+        if (_shellBorderBrush != null) _shellBorderBrush.Opacity = 0;
+        GetMorphHost()?.BeginSpotlightReturnHandoff(handoffDuration);
+
+        ShellContent.CacheMode = null;
+        ShellContent.Effect = null;
+        // The search content has already faded out. Keep its base transparent
+        // while retiring clocks so it cannot flash back during the handoff.
+        ShellContent.Opacity = 0;
+        // Keep the session guard until the content reveal finishes, with the
+        // Spotlight material already invisible instead of crossfading two lenses.
+        var handoffFade = CreateAnimation(0, 0, handoffDuration,
+            new CubicEase { EasingMode = EasingMode.EaseIn }, synchronizedMorph: true);
+        handoffFade.Completed += (_, _) =>
+        {
+            if (generation == _animationGeneration) CompleteHide();
+        };
+        Shell.BeginAnimation(OpacityProperty, handoffFade);
+    }
+
+    private void CompleteEntrance(double finalLeft, double finalTop)
+    {
+        ClearMorphAnimations();
+        ResetNotchMorphSnapshot();
+        Left = finalLeft;
+        Top = finalTop;
+        Shell.Opacity = 1;
+        Shell.Visibility = Visibility.Visible;
+        ShellScale.ScaleX = ShellScale.ScaleY = 1;
+        Shell.Width = double.NaN;
+        Shell.Height = double.NaN;
+        ShellCornerRadius = ExpandedCornerRadius;
+        ShellTopCornerRadius = ExpandedCornerRadius;
+        // Glass already draws its own optical rims. Adding a layout border at
+        // handoff shifts the backdrop by one DIP and changes the lens size.
+        Shell.BorderThickness = new Thickness(IsLiquidGlassEnabled ? 0 : 1);
+        if (_shellBorderBrush != null) _shellBorderBrush.Opacity = 1;
+        AnimateMorphEars(0, 0, TimeSpan.Zero, TimeSpan.Zero);
+        ShellContent.Opacity = 1;
+        ContentTranslate.Y = 0;
+        Shell.CacheMode = null;
+        ShellContent.CacheMode = null;
+        ShellContent.Effect = null;
+        Shell.Effect = null;
+        RestoreShellContentLayout();
+        Shell.Margin = RestingShellMargin;
+        Shell.HorizontalAlignment = HorizontalAlignment.Stretch;
+        // Top-aligned auto-height: the shell hugs its content inside the
+        Shell.VerticalAlignment = VerticalAlignment.Top;
+        Shell.RenderTransformOrigin = new Point(0.5, 0.5);
+        RestoreShadow();
+        _liquidGlass?.SetAnimating(false);
+        _liquidGlass?.SetIdle(true);
+        UpdateGlassClip();
+
+        // Results that arrived mid-morph waited for the shell to land. A
+        _entranceActive = false;
+        if (_pendingContentReveal)
+        {
+            _pendingContentReveal = false;
+            if (!RevealEntranceContentReservation())
+                SetContentShown(true);
+        }
+        else
+        {
+            ClearEntranceContentReservation();
+        }
+    }
+
+    private void CompleteHide()
+    {
+        // Set base values to 0 before removing animation clocks. A completed
+        CancelPendingFreshEntrance();
+        Shell.Opacity = 0;
+        NotchMorphSnapshot.Opacity = 0;
+        ClearMorphAnimations();
+        _liquidGlass?.ClearLiveRegion();
+        RetainGlassForReopen();
+        CompositionTarget.Rendering -= OnLiquidGlassFrameUpdate;
+        _pendingLaunchQuery = null;
+        ClearLaunchFailure();
+        SetResultsDimmed(false, animate: false);
+        UpdateSearchingGrace(false);
+        ResetSelectionGlide();
+        SearchBox.Text = string.Empty;
+        _viewModel.Reset();
+        ResetContentRegion();
+        SearchBox.IsEnabled = true;
+        _isClosing = false;
+        ResetMorphVisuals();
+        ParkWindow();
+        ReleaseMorphSession();
+    }
+
+    private void ResetMorphVisuals()
+    {
+        AnimateGlassReadability(false, animate: false);
+        CancelPendingFreshEntrance();
+        _entranceActive = false;
+        _pendingContentReveal = false;
+        ClearMorphAnimations();
+        ResetNotchMorphSnapshot();
+        Shell.Effect = null;
+        Shell.CacheMode = null;
+        ShellContent.CacheMode = null;
+        ShellContent.Effect = null;
+        RestoreShellContentLayout();
+        Shell.Margin = RestingShellMargin;
+        Shell.HorizontalAlignment = HorizontalAlignment.Stretch;
+        Shell.VerticalAlignment = VerticalAlignment.Top;
+        Shell.Visibility = Visibility.Hidden;
+        Shell.RenderTransformOrigin = new Point(0.5, 0.0);
+        Shell.Opacity = 0;
+        ShellScale.ScaleX = ShellScale.ScaleY = 1;
+        ShellShake.X = 0;
+        Shell.Width = double.NaN;
+        Shell.Height = double.NaN;
+        ShellCornerRadius = ExpandedCornerRadius;
+        ShellTopCornerRadius = ExpandedCornerRadius;
+        if (_shellBorderBrush != null) _shellBorderBrush.Opacity = 1;
+        ShellContent.Opacity = 1;
+        ContentTranslate.Y = 0;
+    }
+
+    private void RestoreShellContentLayout()
+    {
+        // PlayExit freezes the content width to avoid reflow inside the shrinking shell.
+        // Release that reservation before measuring or presenting an open window again.
+        ShellContent.Width = double.NaN;
+        ShellContent.HorizontalAlignment = HorizontalAlignment.Stretch;
+    }
+
+    private bool PrepareNotchMorphSnapshot()
+    {
+        ResetNotchMorphSnapshot();
+        if (IsLiquidGlassEnabled) return false;
+        ISpotlightMorphHost? morphHost = GetMorphHost();
+        if (morphHost == null) return false;
+
+        ImageSource? source = morphHost.CaptureSpotlightMorphVisual();
+        if (source == null) return false;
+
+        NotchMorphSnapshotBrush.ImageSource = source;
+        // The rounded Border is the animated viewport. Keep the bitmap at its
+        NotchMorphSnapshot.Width = double.NaN;
+        NotchMorphSnapshot.Height = double.NaN;
+        // The source must already be visible before the first composition.
+        NotchMorphSnapshot.Opacity = 1;
+        NotchMorphSnapshot.Visibility = Visibility.Visible;
+        return true;
+    }
+
+    private void ResetNotchMorphSnapshot()
+    {
+        NotchMorphSnapshot.BeginAnimation(OpacityProperty, null);
+        NotchMorphSnapshot.BeginAnimation(WidthProperty, null);
+        NotchMorphSnapshot.BeginAnimation(HeightProperty, null);
+        NotchMorphSnapshot.Opacity = 0;
+        NotchMorphSnapshotBrush.ImageSource = null;
+        NotchMorphSnapshot.Width = double.NaN;
+        NotchMorphSnapshot.Height = double.NaN;
+    }
+
+    private MorphSnapshot FreezeCurrentMorphState()
+    {
+        var shadow = Shell.Effect as DropShadowEffect;
+        double presentedWidth = Shell.Width;
+        if (!double.IsFinite(presentedWidth) || presentedWidth <= 0)
+            presentedWidth = Math.Max(1, Shell.ActualWidth);
+        double presentedHeight = Shell.Height;
+        if (!double.IsFinite(presentedHeight) || presentedHeight <= 0)
+            presentedHeight = Math.Max(1, Shell.ActualHeight);
+
+        var snapshot = new MorphSnapshot(
+            Left, Top, presentedWidth, presentedHeight,
+            Math.Clamp(Shell.Opacity, 0, 1),
+            Math.Clamp(_shellBorderBrush?.Opacity ?? 1, 0, 1),
+            ShellCornerRadius, ShellTopCornerRadius,
+            ShellContent.Opacity, ContentTranslate.Y,
+            (ShellContent.Effect as BlurEffect)?.Radius ?? 0,
+            shadow?.BlurRadius ?? NotchShadowBlurRadius,
+            shadow?.ShadowDepth ?? NotchShadowDepth,
+            shadow?.Opacity ?? 0);
+        ClearMorphAnimations();
+        // Clearing a fade reveals its base value. Retire the opening snapshot
+        ResetNotchMorphSnapshot();
+        Left = snapshot.Left;
+        Top = snapshot.Top;
+        ShellScale.ScaleX = 1;
+        ShellScale.ScaleY = 1;
+        Shell.Opacity = snapshot.ShellOpacity;
+        Shell.Width = snapshot.Width;
+        Shell.Height = snapshot.Height;
+        ShellCornerRadius = snapshot.CornerRadius;
+        ShellTopCornerRadius = snapshot.TopCornerRadius;
+        if (_shellBorderBrush != null) _shellBorderBrush.Opacity = snapshot.BorderOpacity;
+        ShellContent.Opacity = snapshot.ContentOpacity;
+        ContentTranslate.Y = snapshot.ContentTranslateY;
+        EnsureContentBlurEffect().Radius = snapshot.ContentBlurRadius;
+        SetMorphShadow();
+        return snapshot;
+    }
+
+    private BlurEffect EnsureContentBlurEffect()
+    {
+        if (ShellContent.Effect is BlurEffect blur)
+            return blur;
+
+        blur = new BlurEffect { Radius = 0 };
+        ShellContent.Effect = blur;
+        return blur;
+    }
+
+    private void ClearMorphAnimations()
+    {
+        Shell.BeginAnimation(OpacityProperty, null);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+        ShellShake.BeginAnimation(TranslateTransform.XProperty, null);
+        Shell.BeginAnimation(WidthProperty, null);
+        Shell.BeginAnimation(HeightProperty, null);
+        BeginAnimation(LeftProperty, null);
+        BeginAnimation(TopProperty, null);
+        BeginAnimation(ShellCornerRadiusProperty, null);
+        BeginAnimation(ShellTopCornerRadiusProperty, null);
+        _shellBorderBrush?.BeginAnimation(Brush.OpacityProperty, null);
+        ShellContent.BeginAnimation(OpacityProperty, null);
+        ContentTranslate.BeginAnimation(TranslateTransform.YProperty, null);
+        NotchMorphSnapshot.Visibility = Visibility.Hidden;
+        NotchMorphSnapshot.BeginAnimation(OpacityProperty, null);
+        NotchMorphSnapshot.BeginAnimation(WidthProperty, null);
+        NotchMorphSnapshot.BeginAnimation(HeightProperty, null);
+        NotchMorphSnapshot.Opacity = 0;
+        if (Shell.Effect is DropShadowEffect shellShadow)
+        {
+            shellShadow.BeginAnimation(DropShadowEffect.BlurRadiusProperty, null);
+            shellShadow.BeginAnimation(DropShadowEffect.ShadowDepthProperty, null);
+            shellShadow.BeginAnimation(DropShadowEffect.OpacityProperty, null);
+        }
+        if (ShellContent.Effect is System.Windows.Media.Effects.BlurEffect blur)
+            blur.BeginAnimation(System.Windows.Media.Effects.BlurEffect.RadiusProperty, null);
+    }
+
+    private bool TryGetNotchRect(
+        out (double Left, double Top, double Width, double Height, double TopCornerRadius, double BottomCornerRadius) rect)
+    {
+        if (GetMorphHost() is { } morphHost)
+        {
+            rect = morphHost.GetSpotlightMorphRect();
+            return rect.Width > 0 && rect.Height > 0;
+        }
+
+        rect = default;
+        return false;
+    }
+
+    private void SetNotchMorphActive(bool active)
+    {
+        GetMorphHost()?.SetSpotlightMorphActive(active);
+    }
+
+    private void SetMorphSessionActive(bool active)
+    {
+        GetMorphHost()?.SetSpotlightMorphSessionActive(active);
+    }
+
+    private void ReleaseMorphSession()
+    {
+        SetNotchMorphActive(false);
+        SetMorphSessionActive(false);
+    }
+
+    private ISpotlightMorphHost? GetMorphHost() =>
+        MorphHostOverride ?? Owner as ISpotlightMorphHost;
+
+    private SolidColorBrush EnsureShellBorderBrush()
+    {
+        if (_shellBorderBrush != null) return _shellBorderBrush;
+        _shellBorderBrush = new SolidColorBrush(System.Windows.Media.Colors.Transparent);
+        Shell.BorderBrush = _shellBorderBrush;
+        return _shellBorderBrush;
+    }
+
+    private void AnimateShellBorder(double from, double to, TimeSpan duration)
+    {
+        SolidColorBrush brush = EnsureShellBorderBrush();
+        brush.BeginAnimation(Brush.OpacityProperty, null);
+        brush.Opacity = from;
+        var fade = CreateAnimation(from, to, duration,
+            new QuadraticEase { EasingMode = EasingMode.EaseOut });
+        brush.BeginAnimation(Brush.OpacityProperty, fade);
+    }
+
+    private void AnimateMorphEars(double fromOpacity, double toOpacity, TimeSpan duration, TimeSpan beginTime)
+    {
+        if (ShellLeftEar == null || ShellRightEar == null) return;
+        if (IsLiquidGlassEnabled)
+        {
+            ShellLeftEar.Opacity = 0;
+            ShellRightEar.Opacity = 0;
+            ShellLeftEar.Visibility = Visibility.Collapsed;
+            ShellRightEar.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        ShellLeftEar.BeginAnimation(OpacityProperty, null);
+        ShellRightEar.BeginAnimation(OpacityProperty, null);
+        ShellLeftEar.Opacity = fromOpacity;
+        ShellRightEar.Opacity = fromOpacity;
+
+        if (Math.Abs(fromOpacity - toOpacity) < 0.001 || duration <= TimeSpan.Zero) return;
+
+        var anim = new DoubleAnimation(fromOpacity, toOpacity, duration)
+        {
+            BeginTime = beginTime,
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut }
+        };
+        Timeline.SetDesiredFrameRate(anim, Math.Min(60, AnimationConfig.TargetFps));
+
+        ShellLeftEar.BeginAnimation(OpacityProperty, anim);
+        ShellRightEar.BeginAnimation(OpacityProperty, anim);
+    }
+
+    private void RestoreShadow()
+    {
+        Shell.Effect = null;
+    }
+
+    private void SetMorphShadow() => RestoreShadow();
+
+    private void AnimateMorphShadow() => RestoreShadow();
+
+    private DoubleAnimation CreateAnimation(
+        double from,
+        double to,
+        TimeSpan duration,
+        IEasingFunction easing,
+        bool synchronizedMorph = false)
+    {
+        var animation = new DoubleAnimation(from, to, duration) { EasingFunction = easing };
+        Timeline.SetDesiredFrameRate(animation,
+            synchronizedMorph && !IsLiquidGlassEnabled ? Math.Min(60, AnimationConfig.TargetFps) : AnimationConfig.TargetFps);
+        return animation;
+    }
+
+    private static IEasingFunction CreateMorphEase() =>
+        new CubicBezierEase(0.16, 1.0, 0.3, 1.0) { EasingMode = EasingMode.EaseIn };
+
+    public static readonly DependencyProperty ShellCornerRadiusProperty =
+        DependencyProperty.Register(
+            nameof(ShellCornerRadius),
+            typeof(double),
+            typeof(SpotlightWindow),
+            new PropertyMetadata(ExpandedCornerRadius, OnShellCornerRadiusChanged));
+
+    // The classic notch has square top corners while the dynamic island is a
+    public static readonly DependencyProperty ShellTopCornerRadiusProperty =
+        DependencyProperty.Register(
+            nameof(ShellTopCornerRadius),
+            typeof(double),
+            typeof(SpotlightWindow),
+            new PropertyMetadata(ExpandedCornerRadius, OnShellCornerRadiusChanged));
+
+    public double ShellCornerRadius
+    {
+        get => (double)GetValue(ShellCornerRadiusProperty);
+        set => SetValue(ShellCornerRadiusProperty, value);
+    }
+
+    public double ShellTopCornerRadius
+    {
+        get => (double)GetValue(ShellTopCornerRadiusProperty);
+        set => SetValue(ShellTopCornerRadiusProperty, value);
+    }
+
+    private static void OnShellCornerRadiusChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is SpotlightWindow window)
+        {
+            double top = Math.Max(0, window.ShellTopCornerRadius);
+            double bottom = Math.Max(0, window.ShellCornerRadius);
+            var corners = new CornerRadius(top, top, bottom, bottom);
+            window.Shell.CornerRadius = corners;
+            window.NotchMorphSnapshot.CornerRadius = corners;
+            window.SyncGlassCornerRadius(corners);
+        }
+    }
+
+    private readonly record struct MorphSnapshot(
+        double Left,
+        double Top,
+        double Width,
+        double Height,
+        double ShellOpacity,
+        double BorderOpacity,
+        double CornerRadius,
+        double TopCornerRadius,
+        double ContentOpacity,
+        double ContentTranslateY,
+        double ContentBlurRadius,
+        double ShadowBlurRadius,
+        double ShadowDepth,
+        double ShadowOpacity);
+}

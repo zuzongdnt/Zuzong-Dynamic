@@ -1,0 +1,227 @@
+using System;
+using System.Diagnostics;
+using VNotch.Services;
+using VNotch.ViewModels;
+
+namespace VNotch.Controllers;
+
+public sealed class CountdownCompletedEventArgs : EventArgs
+{
+    public long RunId { get; }
+
+    public CountdownCompletedEventArgs(long runId)
+    {
+        RunId = runId;
+    }
+}
+
+/// <summary>
+/// Quản lý vòng đời chạy, tạm dừng, đo thời gian thực tế và thông báo hoàn tất của countdown.
+/// Độc lập hoàn toàn với trạng thái hiển thị của WPF view (Workstream C - implement.md).
+/// Commands and Advance run on the UI thread; only the ticker dispatches to it.
+/// </summary>
+public sealed class CountdownController : IDisposable
+{
+    private const string LogTag = "COUNTDOWN-CONTROLLER";
+    private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(100);
+
+    private readonly TimerViewModel _viewModel;
+    private readonly CountdownTracker _tracker;
+    private readonly Action<Action> _runOnUi;
+    private CancellationTokenSource? _tickerCancellation;
+
+    private long _activeRunId;
+    private bool _hasFiredCompletedForRun;
+    private bool _disposed;
+
+    public event EventHandler<CountdownCompletedEventArgs>? Completed;
+    public event EventHandler<long>? RunStarted;
+    public event EventHandler<long>? RunPaused;
+    public event EventHandler<long>? RunReset;
+    public event EventHandler? Tick;
+
+    public long ActiveRunId => _activeRunId;
+    public bool IsRunning => _viewModel.IsRunning;
+    public TimeSpan Duration => _viewModel.Duration;
+    public TimeSpan Remaining => _viewModel.Remaining;
+    public TimerViewModel ViewModel => _viewModel;
+    public CountdownTracker Tracker => _tracker;
+
+    public CountdownController(TimerViewModel viewModel, Action<Action> runOnUi)
+    {
+        _viewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
+        _tracker = new CountdownTracker(_viewModel);
+        _runOnUi = runOnUi ?? throw new ArgumentNullException(nameof(runOnUi));
+
+    }
+
+    public void Start()
+    {
+        if (_disposed) return;
+
+        long runId = ++_activeRunId;
+        _hasFiredCompletedForRun = false;
+        _tracker.Start();
+        StartTicker();
+
+        RuntimeLog.Log(LogTag, $"Countdown run #{runId} started ({_viewModel.Duration})");
+        RunStarted?.Invoke(this, runId);
+    }
+
+    public void Pause()
+    {
+        if (_disposed) return;
+        if (!_viewModel.IsRunning) return;
+
+        StopTicker();
+        bool completed = _tracker.Pause();
+
+        long runId = _activeRunId;
+        RuntimeLog.Log(LogTag, $"Countdown run #{runId} paused (Remaining: {_viewModel.Remaining})");
+        RunPaused?.Invoke(this, runId);
+
+        if (completed && !_hasFiredCompletedForRun)
+        {
+            _hasFiredCompletedForRun = true;
+            TriggerCompleted(runId);
+        }
+    }
+
+    public void Resume()
+    {
+        if (_disposed) return;
+        if (_viewModel.IsRunning || _viewModel.Remaining <= TimeSpan.Zero) return;
+
+        _tracker.Start();
+        StartTicker();
+
+        RuntimeLog.Log(LogTag, $"Countdown run #{_activeRunId} resumed");
+        RunStarted?.Invoke(this, _activeRunId);
+    }
+
+    public void Reset()
+    {
+        if (_disposed) return;
+
+        StopTicker();
+        long runId = ++_activeRunId;
+        _hasFiredCompletedForRun = false;
+        _viewModel.Reset();
+        _tracker.ResetCountdownTimestamp();
+
+        RuntimeLog.Log(LogTag, $"Countdown reset (Duration: {_viewModel.Duration})");
+        RunReset?.Invoke(this, runId);
+    }
+
+    public bool AdjustDuration(int direction)
+    {
+        if (_disposed || _viewModel.IsRunning) return false;
+
+        bool adjusted = _viewModel.Adjust(direction);
+        if (adjusted)
+        {
+            _tracker.ResetCountdownTimestamp();
+        }
+        return adjusted;
+    }
+
+    public bool SetCustomDuration(TimeSpan duration)
+    {
+        if (_disposed) return false;
+
+        if (_viewModel.IsRunning)
+        {
+            StopTicker();
+        }
+
+        bool result = _viewModel.SetCustomDuration(duration);
+        _tracker.ResetCountdownTimestamp();
+        return result;
+    }
+
+    public bool Advance(long? nowTimestamp = null)
+    {
+        if (_disposed || !_viewModel.IsRunning) return false;
+
+        bool completed = nowTimestamp.HasValue
+            ? _tracker.AdvanceCountdown(nowTimestamp.Value)
+            : _tracker.AdvanceCountdown();
+
+        Tick?.Invoke(this, EventArgs.Empty);
+
+        if (completed)
+        {
+            StopTicker();
+            long runId = _activeRunId;
+
+            if (!_hasFiredCompletedForRun)
+            {
+                _hasFiredCompletedForRun = true;
+                TriggerCompleted(runId);
+            }
+        }
+
+        return completed;
+    }
+
+    private void StartTicker()
+    {
+        StopTicker();
+        var cancellation = new CancellationTokenSource();
+        _tickerCancellation = cancellation;
+        RunTickerAsync(cancellation.Token).SafeFireAndForget("COUNTDOWN-TICKER");
+    }
+
+    private void StopTicker()
+    {
+        var cancellation = Interlocked.Exchange(ref _tickerCancellation, null);
+        cancellation?.Cancel();
+        cancellation?.Dispose();
+    }
+
+    private async Task RunTickerAsync(CancellationToken cancellationToken)
+    {
+        // Reuse one callback for this run, and coalesce ticks while the UI is busy.
+        // The token belongs to this run so queued work cannot advance a restarted countdown.
+        int tickPending = 0;
+        Action advance = () =>
+        {
+            try
+            {
+                if (!cancellationToken.IsCancellationRequested) Advance();
+            }
+            finally
+            {
+                Volatile.Write(ref tickPending, 0);
+            }
+        };
+
+        try
+        {
+            using var timer = new PeriodicTimer(TickInterval);
+            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (Interlocked.CompareExchange(ref tickPending, 1, 0) == 0)
+                    _runOnUi(advance);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Expected when countdown ticker stops.
+        }
+    }
+
+    private void TriggerCompleted(long runId)
+    {
+        RuntimeLog.Log(LogTag, $"Countdown run #{runId} completed!");
+        Completed?.Invoke(this, new CountdownCompletedEventArgs(runId));
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        StopTicker();
+    }
+}

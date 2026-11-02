@@ -1,0 +1,201 @@
+$ErrorActionPreference = 'Stop'
+$repository = Split-Path $PSScriptRoot -Parent
+$temporary = Join-Path ([IO.Path]::GetTempPath()) ('vnotch-release-gates-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $temporary | Out-Null
+
+function Expect-Failure([scriptblock]$Action, [string]$ExpectedMessage) {
+    $failed = $false
+    try { & $Action } catch {
+        $failed = $true
+        if ($_.Exception.Message -notmatch $ExpectedMessage) { throw }
+    }
+    if (-not $failed) { throw "Release gate accepted invalid input; expected: $ExpectedMessage" }
+}
+
+function Write-Coverage([int]$Covered, [int]$Valid = 100, [string]$Package = 'V-Notch') {
+    $xml = '<coverage lines-valid="{0}" lines-covered="{1}"><packages><package name="{2}"/></packages></coverage>' -f $Valid, $Covered, $Package
+    Set-Content -LiteralPath (Join-Path $temporary 'run.cobertura.xml') -Value $xml
+}
+
+try {
+    # Local-only ignored scripts disappear on CI checkout even though invoking
+    # them directly succeeds. Validate the literal entrypoints used by CI/release
+    # workflows and the local CI runner before doing the expensive checks.
+    $sources = @(Get-ChildItem -LiteralPath (Join-Path $repository '.github/workflows') -File |
+        Where-Object Extension -in '.yml', '.yaml' | ForEach-Object FullName)
+    $sources += Join-Path $repository 'scripts/c.ps1'
+    $entrypoints = @(foreach ($source in $sources) {
+        [regex]::Matches((Get-Content -LiteralPath $source -Raw), '(?:Tools|Tests|scripts)/[A-Za-z0-9_.-]+\.ps1') |
+            ForEach-Object Value
+    }) | Sort-Object -Unique
+    if ($entrypoints.Count -eq 0) { throw 'No CI script entrypoints found.' }
+    foreach ($entrypoint in $entrypoints) {
+        if (-not (Test-Path -LiteralPath (Join-Path $repository $entrypoint) -PathType Leaf)) {
+            throw "CI entrypoint is missing from the repository: $entrypoint"
+        }
+        $ignoreStatus = & {
+            $PSNativeCommandUseErrorActionPreference = $false
+            & git -C $repository check-ignore --no-index --quiet -- $entrypoint
+            $LASTEXITCODE
+        }
+        if ($ignoreStatus -eq 0) { throw "CI entrypoint is ignored by Git and will be missing from a fresh checkout: $entrypoint" }
+        if ($ignoreStatus -ne 1) { throw "Could not verify Git ignore rules for CI entrypoint: $entrypoint" }
+    }
+
+    # Exercise the build script's actual argument initialization against MSBuild,
+    # without publishing or touching the existing release output.
+    $buildAst = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repository 'scripts/b.ps1'), [ref]$null, [ref]$null)
+    $restoreAssignment = $buildAst.Find({ param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left.Extent.Text -eq '$restoreArguments'
+    }, $true)
+    if (-not $restoreAssignment) { throw 'Build restore argument initialization was not found.' }
+    $probeProject = Join-Path $temporary 'RestoreArguments.proj'
+    Set-Content -LiteralPath $probeProject -Value '<Project />'
+    foreach ($locked in @($false, $true)) {
+        & {
+            $LockedRestore = $locked
+            . ([scriptblock]::Create($restoreAssignment.Extent.Text))
+            $actual = & dotnet msbuild $probeProject -nologo -getProperty:RestoreLockedMode @restoreArguments
+            if ($LASTEXITCODE -ne 0) { throw "Build arguments were rejected by MSBuild (LockedRestore=$locked)." }
+            $expected = if ($locked) { 'true' } else { '' }
+            if (($actual -join '').Trim() -ne $expected) {
+                throw "Incorrect RestoreLockedMode passed to MSBuild (LockedRestore=$locked)."
+            }
+        }
+    }
+
+    $coverageScript = Join-Path $repository 'Tools/Assert-Coverage.ps1'
+    $versionAssignment = $buildAst.Find({ param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left.Extent.Text -eq '$versionArguments'
+    }, $true)
+    if (-not $versionAssignment) { throw 'Build version argument initialization was not found.' }
+    & {
+        $ReleaseVersion = '2.0.1-beta.184.2'
+        $assemblyVersion = '2.0.0.0'
+        $installerVersion = '2.0.184.2'
+        $InformationalVersion = "$ReleaseVersion+build.1234567890.2.sha.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        . ([scriptblock]::Create($versionAssignment.Extent.Text))
+        $actual = & dotnet msbuild $probeProject -nologo -getProperty:Version,AssemblyVersion,FileVersion,InformationalVersion,PackageManifestVersion @versionArguments
+        if ($LASTEXITCODE -ne 0) { throw 'Build version arguments were rejected by MSBuild.' }
+        $properties = ($actual -join "`n" | ConvertFrom-Json).Properties
+        if ($properties.Version -ne $ReleaseVersion -or $properties.AssemblyVersion -ne $assemblyVersion -or
+            $properties.FileVersion -ne $installerVersion -or $properties.PackageManifestVersion -ne $installerVersion -or
+            $properties.InformationalVersion -ne $InformationalVersion) { throw 'Build identity was not passed intact to MSBuild.' }
+    }
+
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary } 'No Cobertura'
+    Write-Coverage 70
+    & $coverageScript -ResultsDirectory $temporary
+    $duplicate = Join-Path $temporary 'duplicate.cobertura.xml'
+    Copy-Item -LiteralPath (Join-Path $temporary 'run.cobertura.xml') -Destination $duplicate
+    & $coverageScript -ResultsDirectory $temporary
+    Write-Coverage 69
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary } 'require.*line details'
+    Remove-Item -LiteralPath $duplicate
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary } 'below the required threshold'
+    Write-Coverage 69999 100000
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary } 'below the required threshold'
+    Write-Coverage 70000 100000
+    & $coverageScript -ResultsDirectory $temporary
+    Write-Coverage 100
+    & $coverageScript -ResultsDirectory $temporary
+    Write-Coverage 0 0
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary } 'empty or has invalid'
+    Write-Coverage 100 100 'TestAssembly'
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary } 'No coverage report contains'
+    Set-Content -LiteralPath (Join-Path $temporary 'run.cobertura.xml') -Value '<!DOCTYPE coverage [<!ENTITY x SYSTEM "file:///not-read">]><coverage>&x;</coverage>'
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary } 'DTD|security reasons'
+
+    # Distinct suites cover complementary lines of the same class. Extra assemblies
+    # and the duplicate per-method line records must not inflate application coverage.
+    $suite1 = '<coverage lines-valid="4" lines-covered="2"><packages><package name="V-Notch"><classes><class name="Example" filename="Services/Example.cs"><methods><method><lines><line number="1" hits="1"/></lines></method></methods><lines><line number="1" hits="1"/><line number="2" hits="1"/><line number="3" hits="0"/><line number="4" hits="0"/></lines></class></classes></package></packages></coverage>'
+    $suite2 = $suite1.Replace('lines-valid="4" lines-covered="2"', 'lines-valid="5" lines-covered="3"').Replace('number="2" hits="1"', 'number="2" hits="0"').Replace('number="3" hits="0"', 'number="3" hits="1"').Replace('</packages>', '<package name="TestAssembly"><classes><class name="Test" filename="Test.cs"><lines><line number="1" hits="1"/></lines></class></classes></package></packages>')
+    Set-Content -LiteralPath (Join-Path $temporary 'run.cobertura.xml') -Value $suite1
+    Set-Content -LiteralPath $duplicate -Value $suite2
+    & $coverageScript -ResultsDirectory $temporary -MinimumPercent 75
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary -MinimumPercent 76 } 'below the required threshold'
+    Copy-Item -LiteralPath $duplicate -Destination (Join-Path $temporary 'collector-copy.cobertura.xml')
+    & $coverageScript -ResultsDirectory $temporary -MinimumPercent 75
+    Remove-Item -LiteralPath $duplicate, (Join-Path $temporary 'collector-copy.cobertura.xml')
+    Set-Content -LiteralPath (Join-Path $temporary 'run.cobertura.xml') -Value $suite2
+    & $coverageScript -ResultsDirectory $temporary -MinimumPercent 50
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary -MinimumPercent 51 } 'below the required threshold'
+
+    $methodSuite = '<coverage lines-valid="3" lines-covered="1"><packages><package name="V-Notch"><classes><class name="Example" filename="Example.cs"><methods><method name="M" signature="()"><lines><line number="1" hits="1"/></lines></method><method name="N" signature="()"><lines><line number="1" hits="0"/><line number="2" hits="0"/></lines></method></methods><lines><line number="1" hits="1"/><line number="2" hits="0"/></lines></class></classes></package></packages></coverage>'
+    Set-Content -LiteralPath (Join-Path $temporary 'run.cobertura.xml') -Value $methodSuite
+    Set-Content -LiteralPath $duplicate -Value $methodSuite.Replace('name="M" signature="()"><lines><line number="1" hits="1"', 'name="M" signature="()"><lines><line number="1" hits="0"').Replace('name="N" signature="()"><lines><line number="1" hits="0"', 'name="N" signature="()"><lines><line number="1" hits="1"')
+    Set-Content -LiteralPath (Join-Path $temporary 'unrelated.cobertura.xml') -Value '<coverage lines-valid="0" lines-covered="0"><packages><package name="TestAssembly"/></packages></coverage>'
+    & $coverageScript -ResultsDirectory $temporary -MinimumPercent 66
+    Expect-Failure { & $coverageScript -ResultsDirectory $temporary -MinimumPercent 67 } 'below the required threshold'
+
+    $modelRoot = Join-Path $temporary 'payload'
+    $modelDirectory = Join-Path $modelRoot 'Models'
+    New-Item -ItemType Directory -Path $modelDirectory | Out-Null
+    foreach ($asset in 'yolox_nano.onnx', 'YOLOX-LICENSE.txt', 'model-provenance.json') {
+        Copy-Item -LiteralPath (Join-Path $repository "Models/$asset") -Destination $modelDirectory
+    }
+    $modelScript = Join-Path $repository 'Tools/Assert-ModelAssets.ps1'
+    & $modelScript -RootDirectory $modelRoot
+    Set-Content -LiteralPath (Join-Path $modelDirectory 'YOLOX-LICENSE.txt') -Value 'Apache License Version 2.0 Megvii'
+    Expect-Failure { & $modelScript -RootDirectory $modelRoot } 'complete upstream YOLOX license'
+    Copy-Item -LiteralPath (Join-Path $repository 'Models/YOLOX-LICENSE.txt') -Destination $modelDirectory -Force
+    Set-Content -LiteralPath (Join-Path $modelDirectory 'yolo11n.onnx') -Value 'unreviewed'
+    Expect-Failure { & $modelScript -RootDirectory $modelRoot } 'Only the reviewed'
+    Remove-Item -LiteralPath (Join-Path $modelDirectory 'yolo11n.onnx')
+    [IO.File]::WriteAllBytes((Join-Path $modelDirectory 'yolox_nano.onnx'), [byte[]](0, 1, 2))
+    Expect-Failure { & $modelScript -RootDirectory $modelRoot } 'checksum or length'
+    Expect-Failure { & (Join-Path $repository 'scripts/b.ps1') -RequireAuthenticode } 'thumbprint is required'
+
+    $signDirectory = Join-Path $temporary 'manifest-signing'
+    New-Item -ItemType Directory -Path $signDirectory | Out-Null
+    $privateKeyFile = Join-Path $signDirectory 'test-private.pem'
+    $publicKeyFile = Join-Path $signDirectory 'test-public.pem'
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        $testKey = [Security.Cryptography.ECDsa]::Create([Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+        try {
+            [IO.File]::WriteAllText($privateKeyFile, $testKey.ExportPkcs8PrivateKeyPem())
+            [IO.File]::WriteAllText($publicKeyFile, $testKey.ExportSubjectPublicKeyInfoPem())
+        } finally {
+            $testKey.Dispose()
+        }
+    } else {
+        $pwsh = Get-Command pwsh.exe -ErrorAction Stop
+        & $pwsh.Source -NoProfile -Command "
+            `$k = [Security.Cryptography.ECDsa]::Create([Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+            try {
+                [IO.File]::WriteAllText('$privateKeyFile', `$k.ExportPkcs8PrivateKeyPem())
+                [IO.File]::WriteAllText('$publicKeyFile', `$k.ExportSubjectPublicKeyInfoPem())
+            } finally { `$k.Dispose() }
+        "
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to generate temporary ECDSA test keys via pwsh.' }
+    }
+    $signScript = Join-Path $repository 'scripts/Sign-UpdateManifest.ps1'
+    foreach ($installerName in @('V-Notch-Setup.exe', 'V-Notch-Setup-SelfContained.exe')) {
+        $dummyInstaller = Join-Path $signDirectory $installerName
+        [IO.File]::WriteAllBytes($dummyInstaller, [Text.Encoding]::ASCII.GetBytes("MZ-$installerName"))
+        & $signScript -InstallerPath $dummyInstaller -Version '2.0.1' -PrivateKeyPath $privateKeyFile -PublicKeyPath $publicKeyFile | Out-Null
+        $sidecarText = [IO.File]::ReadAllText("$dummyInstaller.sha256")
+        if (-not $sidecarText.EndsWith("`n")) {
+            throw "Expected .sha256 sidecar for $installerName to end with a trailing newline."
+        }
+    }
+    $checksumsPath = Join-Path $signDirectory 'checksums.txt'
+    $concatenatedBytes = [byte[]]@(foreach ($shaFile in Get-ChildItem -LiteralPath $signDirectory -Filter '*.sha256' | Sort-Object Name) {
+        [IO.File]::ReadAllBytes($shaFile.FullName)
+    })
+    [IO.File]::WriteAllBytes($checksumsPath, $concatenatedBytes)
+    if ((Get-Content -LiteralPath $checksumsPath).Count -ne 2) {
+        throw 'Concatenated .sha256 sidecars must produce 1 line per installer in checksums.txt.'
+    }
+
+    Write-Host 'Release gates passed: coverage boundaries, merged suites/assemblies, duplicate reports, XML safety, model allowlist/hash/license, required signing, manifest checksums.'
+} finally {
+    $resolved = [IO.Path]::GetFullPath($temporary)
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($resolved) -notlike 'vnotch-release-gates-*') { throw 'Unsafe temporary cleanup path.' }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+}

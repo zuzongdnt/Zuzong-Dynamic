@@ -192,7 +192,7 @@ internal sealed class ZuzongUpdateService : IUpdateService, IDisposable
         var start = new ProcessStartInfo("powershell.exe") { UseShellExecute = false, CreateNoWindow = true };
         foreach (string arg in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper }) start.ArgumentList.Add(arg);
         using var process = Process.Start(start) ?? throw new IOException("Không mở được trình cài cập nhật.");
-        await Application.Current.Dispatcher.InvokeAsync(() => Application.Current.Shutdown());
+        await App.RequestShutdownAsync().ConfigureAwait(false);
     }
 
     private void EnsureNetwork()

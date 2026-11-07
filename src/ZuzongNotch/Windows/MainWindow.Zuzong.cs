@@ -9,6 +9,7 @@ using VNotch.Services;
 
 namespace VNotch;
 public partial class MainWindow {
+ internal bool CanReleaseLiteCaches=>!_isExpanded&&!_isAnimating;
  DispatcherTimer? _zuzongTimer;
  DateTime _zuzongStamp,_zuzongTaskbarStamp,_zuzongCommandStamp,_zuzongNoticeStamp;
  int _zuzongTicks,_zuzongNotices;

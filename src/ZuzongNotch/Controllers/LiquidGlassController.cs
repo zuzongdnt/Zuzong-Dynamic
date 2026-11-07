@@ -239,6 +239,7 @@ public sealed partial class LiquidGlassController : IDisposable
     private byte[] _outBuffer = Array.Empty<byte>();
     private byte[] _sourceBlurBuffer = Array.Empty<byte>();
     private byte[] _sourceBlurTmp = Array.Empty<byte>();
+    private long _idleScratchTrimAt;
 
     private IntPtr _memDc;
     private IntPtr _dibBmp;
@@ -720,6 +721,7 @@ public sealed partial class LiquidGlassController : IDisposable
     {
         if (_idle == idle) return;
         _idle = idle;
+        _idleScratchTrimAt = Environment.TickCount64 + 3000;
         ForceRefresh();
     }
 
@@ -1056,6 +1058,14 @@ public sealed partial class LiquidGlassController : IDisposable
 
         TryRenderRegion(region.Value, generation);
         if (!ShouldContinueWorker(generation)) return false;
+
+        if (_idle && !_animating && !_presentInFlight && Environment.TickCount64 >= _idleScratchTrimAt)
+        {
+            _idleScratchTrimAt = Environment.TickCount64 + 30000;
+            long released = TrimIdleScratchBuffers();
+            if (released >= 1024 * 1024)
+                ZuzongLiteMemory.ReleaseIdleGarbage(() => _idle && !_animating && _isActive);
+        }
 
         TrackDiagnostics(frameStart);
         double workMs = clock.Elapsed.TotalMilliseconds - frameStart;
@@ -2687,6 +2697,31 @@ public sealed partial class LiquidGlassController : IDisposable
         // 64K pixels per buffer instead of retaining another full-sized frame.
         int slack = Math.Clamp(current / 4, 4096, 65536);
         return Math.Max(required, checked(current + slack));
+    }
+
+    // Worker-thread only: do not keep a file-shelf-sized refraction map after
+    // returning to the small clock/music pill. The displayed bitmap stays valid.
+    internal long TrimIdleScratchBuffers()
+    {
+        if (_outW <= 0 || _outH <= 0 || _srcW <= 0 || _srcH <= 0) return 0;
+        long released = 0;
+        void Shrink<T>(ref T[] buffer, int required, int elementBytes)
+        {
+            if (required <= 0 || buffer.Length <= Math.Max((long)required * 2, required + 65536L)) return;
+            released += (long)(buffer.Length - required) * elementBytes;
+            Array.Resize(ref buffer, required);
+        }
+        Shrink(ref _outBuffer, checked(_outW * _outH * 4), 1);
+        Shrink(ref _refractMap, checked(_outW * _outH * 6), sizeof(int));
+        Shrink(ref _sourceBlurBuffer, checked(_srcW * _srcH * 4), 1);
+        Shrink(ref _sourceBlurTmp, checked(_srcW * _srcH * 4), 1);
+        if (released > 0)
+        {
+            _mapsDirty = true;
+            _frameHistory.Clear();
+            _forceRefreshNeeded = true;
+        }
+        return released;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

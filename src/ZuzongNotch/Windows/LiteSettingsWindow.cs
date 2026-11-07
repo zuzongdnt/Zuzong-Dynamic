@@ -44,7 +44,12 @@ public class SettingsWindow : Window
         Width = 740; Height = 760; MinWidth = 580; MinHeight = 500; WindowStartupLocation = WindowStartupLocation.CenterScreen;
         FontFamily = new FontFamily("Segoe UI"); FontSize = 14; Foreground = Brushes.White; Background = new SolidColorBrush(Color.FromRgb(17, 18, 21));
         Loc.LanguageChanged += Rebuild;
-        Closed += (_, _) => { Loc.LanguageChanged -= Rebuild; _presenter?.Dispose(); if (_ownsUpdates && _updates is IDisposable d) d.Dispose(); };
+        Closed += (_, _) =>
+        {
+            Loc.LanguageChanged -= Rebuild; _presenter?.Dispose(); if (_ownsUpdates && _updates is IDisposable d) d.Dispose();
+            var owner = Owner as MainWindow;
+            ZuzongLiteMemory.ReleaseIdleGarbage(() => owner?.CanReleaseLiteCaches != false);
+        };
         Rebuild();
     }
 

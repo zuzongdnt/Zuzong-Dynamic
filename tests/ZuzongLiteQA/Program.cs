@@ -54,6 +54,15 @@ static class Program
                         Check(Loc.GetAvailableLanguages().Select(x => x.Code).Order().SequenceEqual(new[] { "en", "vi" }), "only English and Vietnamese are offered");
                         Check(typeof(App).Assembly.GetManifestResourceNames().Count(n => n.StartsWith("VNotch.Locales.")) == 2, "only two language resources are embedded");
                         var process = Process.GetCurrentProcess(); process.Refresh(); File.WriteAllText(Path.Combine(Root, "memory-before-settings.json"), JsonSerializer.Serialize(new { workingSet = process.WorkingSet64, privateBytes = process.PrivateMemorySize64 }));
+                        using (var glass = new LiquidGlassController(new Image(), () => IntPtr.Zero, () => null))
+                        {
+                            void Put(string name, object value) => typeof(LiquidGlassController).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(glass, value);
+                            Put("_outW", 100); Put("_outH", 50); Put("_srcW", 120); Put("_srcH", 80);
+                            Put("_outBuffer", new byte[1000000]); Put("_refractMap", new int[1000000]); Put("_sourceBlurBuffer", new byte[1000000]); Put("_sourceBlurTmp", new byte[1000000]);
+                            Check(glass.TrimIdleScratchBuffers() > 6000000, "collapsed glass releases oversized scratch capacity");
+                            Check(Field<int[]>(glass, "_refractMap").Length == 100 * 50 * 6 && Field<byte[]>(glass, "_sourceBlurBuffer").Length == 120 * 80 * 4, "trimmed refraction and blur buffers retain the required frame dimensions");
+                            Check(glass.TrimIdleScratchBuffers() == 0 && Field<bool>(glass, "_mapsDirty") && Field<bool>(glass, "_forceRefreshNeeded"), "idle trimming is bounded and forces a valid frame rebuild");
+                        }
                         Field<System.Windows.Threading.DispatcherTimer>(main, "_zuzongTimer").Stop();
                         var media = App.Services.GetRequiredService<IMediaDetectionService>(); media.Stop(); await Task.Delay(600);
                         var fakeMedia = new VNotch.Tests.Fakes.FakeMediaDetectionService();

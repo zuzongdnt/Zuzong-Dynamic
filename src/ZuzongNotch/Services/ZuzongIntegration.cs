@@ -55,6 +55,7 @@ internal static class ZuzongIntegration {
   var tabs=s.VisibleNavTabs.Split(',',StringSplitOptions.RemoveEmptyEntries).ToHashSet();if(Bool(c,"files",true))tabs.Add("Secondary");else tabs.Remove("Secondary");s.VisibleNavTabs=string.Join(",",tabs);
   
   s.LastRunVersion=AppVersion.Current;s.HasSeenSpotlightIntro=true;s.HasSeenCpp26Notice=true;
+  ZuzongLite.Apply(s);
  }
  internal static void WriteBasicFromFull(NotchSettings s){
   if(!File.Exists(ConfigPath))return;

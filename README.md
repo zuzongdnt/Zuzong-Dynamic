@@ -1,6 +1,10 @@
-# Zuzong Dynamic
+# Zuzong Dynamic Lite
 
-Ứng dụng Dynamic Notch độc lập cho Windows, có trình phát nhạc, đồng hồ, khay file và giao diện kính lỏng tùy chỉnh.
+Ứng dụng Dynamic Notch độc lập cho Windows, có trình phát nhạc, đồng hồ, pin, hẹn giờ, mixer âm lượng, khay file và kính lỏng tùy chỉnh. Bản 1.1.0 là Lite, chỉ có tiếng Việt và tiếng Anh.
+
+Lite bỏ video Canvas, lịch sử clipboard, nền/vầng sáng album và lời nhạc/phụ đề trực tuyến. Khay file chỉ lưu đường dẫn gốc, không sao chép nội dung. Thông báo đã sao chép và Codex vẫn có công tắc riêng. Các bộ AI cục bộ, ONNX và WebView2 không còn trong gói.
+
+Các trang cấu hình chưa phù hợp với Lite như AI/dịch cục bộ, camera, thời tiết, tiện ích phụ và đăng nhập Spotify đã được rút khỏi giao diện. Nhạc Spotify/YouTube qua phiên media của Windows vẫn được hỗ trợ. Hồ sơ và dữ liệu clipboard cũ được giữ lại; bản đầy đủ trước đây có ở tag `v1.0.5`.
 
 - Tải bộ cài: https://github.com/zuzongdnt/Zuzong-Dynamic/releases/latest
 - Báo lỗi / đề xuất: https://github.com/zuzongdnt/Zuzong-Dynamic/issues
@@ -20,7 +24,8 @@ Yêu cầu .NET SDK 8+ và Inno Setup 7. Native DLL và shader dựng sẵn đư
 
 ```powershell
 ./installer/build.ps1 -Compiler 'C:\path\to\ISCC.exe'
-dotnet run --project tests/ZuzongUpdateQA -c Release -p:SkipNativeCompile=true -p:SkipShaderCompile=true -- --isolated-data --settings E:/temp/zuzong-update-qa/notch.json
+dotnet run --project tests/ZuzongUpdateQA -c Release -p:SkipNativeCompile=true -p:SkipShaderCompile=true -- --isolated-data --settings C:/temp/zuzong-update-qa/notch.json
+dotnet run --project tests/ZuzongLiteQA -c Release -p:SkipNativeCompile=true -p:SkipShaderCompile=true -- --isolated-data --settings C:/temp/zuzong-lite-qa/notch.json
 ```
 
 ## Phát hành bản tiếp theo
@@ -36,4 +41,4 @@ Không đưa khóa riêng, file `.env`, dữ liệu người dùng vào Git. Git
 
 Bản tùy chỉnh dựa trên [V-Notch của w0otdev](https://github.com/w0otdev/V-Notch), giấy phép Apache-2.0. Giữ nguyên [giấy phép gốc](src/ZuzongNotch/LICENSE) và [ghi nhận thư viện](src/ZuzongNotch/docs/THIRD_PARTY_NOTICES.md). Thay đổi của Zuzong: ứng dụng độc lập, nhận diện Z, cấu hình riêng, tối ưu khởi động/kính lỏng, UI và cập nhật theo repo này.
 
-Bộ cài hiện chưa có chứng thư ký mã của Zuzong. Hiệu ứng kính có thể không xuất hiện trong ảnh chụp/ghi màn hình do cơ chế loại Notch khỏi nguồn lấy nền.
+Bộ cài hiện chưa có chứng thư ký mã của Zuzong. Hiệu ứng kính có thể không xuất hiện trong ảnh chụp/ghi màn hình do cơ chế loại Notch khỏi nguồn lấy nền. Dữ liệu thử không đặt dưới junction/symlink vì cơ chế bảo vệ lưu hồ sơ từ chối các đường dẫn đó.

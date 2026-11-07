@@ -7,6 +7,7 @@ public partial class MainWindow
     private LiveTranslationController? _liveTranslation;
     private void InitializeLiveTranslation()
     {
+        if (!_settings.EnableLiveTranslation) return;
         _liveTranslation ??= new LiveTranslationController(
             Dispatcher,
             () => OpenAppSettings(showTranslation: true),

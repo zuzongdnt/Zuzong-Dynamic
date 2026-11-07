@@ -13,16 +13,16 @@ public partial class MainWindow
     internal string? ClipboardHotkeyRegistrationError => _clipboardHotkey?.RegistrationError;
     private void DisposeClipboardHotkey() => _clipboardHotkey?.Dispose();
     private ClipboardHistoryController? _clipboardHistory;
-    private VNotch.Controls.ClipboardTray? _clipboardTrayView;
-    internal VNotch.Controls.ClipboardTray ClipboardTrayView
+    private VNotch.Controls.LiteFileShelf? _clipboardTrayView;
+    internal VNotch.Controls.LiteFileShelf ClipboardTrayView
     {
         get
         {
             if (_clipboardTrayView != null) return _clipboardTrayView;
             ObjectDisposedException.ThrowIf(_cleanedUp, this);
-            var view = new VNotch.Controls.ClipboardTray { Name = nameof(ClipboardTrayView) };
+            var view = new VNotch.Controls.LiteFileShelf { Name = nameof(ClipboardTrayView) };
             _clipboardTrayView = view;
-            view.SetBinding(VNotch.Controls.ClipboardTray.NavigationWidthProperty,
+            view.SetBinding(VNotch.Controls.LiteFileShelf.NavigationWidthProperty,
                 new System.Windows.Data.Binding(nameof(ActualWidth)) { Source = NavTabsStackPanel });
             System.Windows.Data.BindingOperations.SetBinding(view.HeaderTranslate,
                 System.Windows.Media.TranslateTransform.YProperty,
@@ -32,7 +32,6 @@ public partial class MainWindow
             RegisterName(nameof(ClipboardTrayView), view);
             LocalizedPresentation.Apply(view);
             AnimationPrimitives.ApplyFpsToTree(view);
-            if (_clipboardHistory != null) view.Attach(_clipboardHistory);
             if (ClipboardTrayHost.IsVisible)
             {
                 ClipboardTrayHost.ApplyTemplate();
@@ -62,10 +61,7 @@ public partial class MainWindow
 
     private void InitializeClipboardHistory(VNotch.Services.Clipboard.ClipboardHistoryStore? store)
     {
-        _clipboardHistory = new ClipboardHistoryController(Dispatcher, store);
-        _clipboardHistory.ApplySettings(_settings);
-        _clipboardHistory.DropImported += PlayClipboardDropFeedback;
-        _clipboardTrayView?.Attach(_clipboardHistory);
+        _clipboardHistory = null;
         _clipboardHotkey = new ClipboardHotkeyController(this, () =>
         {
             if (_cleanedUp || _isGreetingActive || _isAnimating) return;

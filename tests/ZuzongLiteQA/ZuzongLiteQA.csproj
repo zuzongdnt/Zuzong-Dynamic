@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0-windows10.0.19041.0</TargetFramework><UseWPF>true</UseWPF><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AssemblyName>VNotch.Tests</AssemblyName><RuntimeIdentifier>win-x64</RuntimeIdentifier></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../src/ZuzongNotch/V-Notch.csproj"/><Compile Include="../../src/ZuzongNotch/Tools/TestSupport/BackgroundTestDesktop.cs" Link="BackgroundTestDesktop.cs"/><Compile Include="../../src/ZuzongNotch/Tests/Fakes/ServiceFakes.cs" Link="ServiceFakes.cs"/></ItemGroup>
+</Project>

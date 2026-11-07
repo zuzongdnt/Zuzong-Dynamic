@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup><Resource Include="Assets\ZuzongSupportQr.png" /></ItemGroup>
 
@@ -42,12 +42,12 @@
          reflection, COM interop or CPU/GPU translation backends. -->
     <EnableCompressionInSingleFile Condition="'$(Configuration)' == 'Release' And '$(SelfContained)' == 'true'">true</EnableCompressionInSingleFile>
     <PublishReferencesDocumentationFiles>false</PublishReferencesDocumentationFiles>
-    <Version>1.0.5</Version>
-    <AssemblyVersion>1.0.5.0</AssemblyVersion>
-    <FileVersion>1.0.5.0</FileVersion>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
     <Authors>Zuzong;w0otdev</Authors>
     <Company>Zuzong</Company>
-    <Product>Zuzong Dynamic Notch</Product>
+    <Product>Zuzong Dynamic Lite</Product>
     <Copyright>Copyright © 2026 w0otdev</Copyright>
     <PackageId>V-Notch</PackageId>
     <PackageProjectUrl>https://github.com/zuzongdnt/Zuzong-Dynamic</PackageProjectUrl>
@@ -62,14 +62,8 @@
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
     <PackageReference Include="Hardcodet.NotifyIcon.Wpf" Version="2.0.1" />
-    <PackageReference Include="LanguageDetection.Ai" Version="1.1.0" />
-    <PackageReference Include="LLamaSharp" Version="0.27.0" />
-    <PackageReference Include="LLamaSharp.Backend.Cpu" Version="0.27.0" />
-    <PackageReference Include="LLamaSharp.Backend.Vulkan.Windows" Version="0.27.0" />
     <PackageReference Include="Markdig" Version="0.41.3" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.31.0" />
-    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4078.44" />
     <PackageReference Include="System.Data.OleDb" Version="8.0.1" />
     <PackageReference Include="Vortice.Direct3D9" Version="3.8.3" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
@@ -80,6 +74,9 @@
     <Compile Remove="Tests\**\*.cs" />
     <Compile Remove="Tools\**\*.cs" />
     <Compile Remove="Uninstall\**\*.cs" />
+    <Compile Remove="Windows\SettingsWindow*.cs;Windows\ZuzongAppearanceWindow.cs;Windows\ZuzongFeaturesWindow.cs;Windows\SpotifyLoginWindow.xaml.cs;Windows\SpotifyBrowserConnectWindow.cs;Services\SmartThumbnailCropService.cs;Services\Translation\QwenTranslationEngine.cs;Services\Translation\TranslationLanguages.cs" />
+    <Page Remove="Windows\SettingsWindow.xaml;Windows\SpotifyLoginWindow.xaml" />
+    <Compile Remove="Windows\MainWindow.Lyrics.cs;Windows\MainWindow.MediaBackground.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -89,7 +86,7 @@
     <EmbeddedResource Include="Assets\MediaProtocols.json" LogicalName="VNotch.MediaProtocols.json" />
     <EmbeddedResource Include="docs\TERMS_OF_SERVICE.md" LogicalName="VNotch.TERMS_OF_SERVICE.md" />
     <EmbeddedResource Include="docs\TERMS_OF_SERVICE_VI.md" LogicalName="VNotch.TERMS_OF_SERVICE_VI.md" />
-    <EmbeddedResource Include="Locales\*.json" LogicalName="VNotch.Locales.%(FileName).json" />
+    <EmbeddedResource Include="Locales\en.json;Locales\vi.json" LogicalName="VNotch.Locales.%(FileName).json" />
   </ItemGroup>
 
   <ItemGroup>
@@ -116,7 +113,7 @@
   </Target>
 
   <ItemGroup>
-    <None Update="Models\yolox_nano.onnx" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Update="Models\yolox_nano.onnx" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
     <None Update="Models\YOLOX-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <None Update="Models\model-provenance.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <None Include="Package.appxmanifest" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
@@ -142,21 +139,21 @@
     <Resource Include="Shaders\LiquidGlassRefraction.ps" />
     <Resource Include="Assets\Flags\flag_en.png" />
     <Resource Include="Assets\Flags\flag_vi.png" />
-    <Resource Include="Assets\Flags\flag_es.png" />
-    <Resource Include="Assets\Flags\flag_fr.png" />
-    <Resource Include="Assets\Flags\flag_de.png" />
-    <Resource Include="Assets\Flags\flag_ja.png" />
-    <Resource Include="Assets\Flags\flag_hi.png" />
-    <Resource Include="Assets\Flags\flag_zh.png" />
-    <Resource Include="Assets\Flags\flag_pt.png" />
-    <Resource Include="Assets\Flags\flag_ru.png" />
-    <Resource Include="Assets\Flags\flag_ar.png" />
-    <Resource Include="Assets\Flags\flag_ko.png" />
-    <Resource Include="Assets\Flags\flag_it.png" />
-    <Resource Include="Assets\Flags\flag_tr.png" />
-    <Resource Include="Assets\Flags\flag_pl.png" />
-    <Resource Include="Assets\Flags\flag_nl.png" />
-    <Resource Include="Assets\Flags\flag_id.png" />
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   </ItemGroup>
   <!-- Recompiles the committed LiquidGlass pixel shader only when the HLSL source is newer
        than the .ps output (Inputs/Outputs). Override the compiler with -p:FxcPath=...,

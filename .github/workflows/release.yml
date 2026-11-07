@@ -33,6 +33,7 @@ jobs:
           dotnet run --project tests/ZuzongUpdateQA -c Release -p:SkipNativeCompile=true -p:SkipShaderCompile=true -- --isolated-data --settings "$env:RUNNER_TEMP/update-qa/notch.json"
           if ($LASTEXITCODE -ne 0) { throw 'Updater checks failed.' }
       - name: Build self-contained installer
+        # The WPF smoke/render suite is also run on an isolated local desktop before tagging.
         shell: pwsh
         run: ./installer/build.ps1 -Compiler "$pwd/work/inno/tools/ISCC.exe"
       - name: Publish release
@@ -40,7 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $arguments = @('release', 'create', "v$env:APP_VERSION", "outputs/ZuzongDynamic-Setup-$env:APP_VERSION-x64.exe", "outputs/ZuzongDynamic-Setup-$env:APP_VERSION-x64.exe.sha256", '--title', "Zuzong Dynamic $env:APP_VERSION", '--generate-notes', '--verify-tag')
+          $arguments = @('release', 'create', "v$env:APP_VERSION", "outputs/ZuzongDynamic-Setup-$env:APP_VERSION-x64.exe", "outputs/ZuzongDynamic-Setup-$env:APP_VERSION-x64.exe.sha256", '--title', "Zuzong Dynamic Lite $env:APP_VERSION", '--generate-notes', '--verify-tag')
           if ($env:APP_VERSION.Contains('-')) { $arguments += '--prerelease' }
           gh @arguments
           if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }

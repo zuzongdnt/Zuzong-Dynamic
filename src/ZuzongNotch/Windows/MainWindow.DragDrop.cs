@@ -21,7 +21,7 @@ public partial class MainWindow
     {
         if(!ZuzongTargetEnabled(NotchView.Secondary)){e.Effects=DragDropEffects.None;e.Handled=true;return;}
         if (_clipboardHistory?.IsDragging == true) return;
-        _clipboardDragCanDrop = ClipboardDropReader.Supports(e.Data);
+        _clipboardDragCanDrop = VNotch.Controls.LiteFileShelf.Supports(e.Data);
         if (e.Data.GetDataPresent(DataFormats.FileDrop))
             _clipboardDragCanDrop = e.Data.GetData(DataFormats.FileDrop) is string[] { Length: > 0 } files
                 && files.All(ClipboardImportPaths.IsLocal) && files.Length <= ClipboardHistoryStore.MaxImportItems;
@@ -86,12 +86,11 @@ public partial class MainWindow
         if(!ZuzongTargetEnabled(NotchView.Secondary)){e.Effects=DragDropEffects.None;e.Handled=true;return;}
         CancelDragDropTimers(); _clipboardDragAutoExpanded = false; _clipboardDragCanDrop = false;
         e.Handled = true;
-        if (_clipboardHistory == null || _clipboardHistory.IsDragging || !ClipboardDropReader.Supports(e.Data))
+        if (!VNotch.Controls.LiteFileShelf.Supports(e.Data))
         { e.Effects = DragDropEffects.None; return; }
         e.Effects = DragDropEffects.Copy;
         _transitionCoordinator.RequestView(NotchView.Secondary, "ClipboardDrop");
-        if (ClipboardTrayView != null) await ClipboardTrayView.ImportCurrentCategoryDropAsync(e.Data);
-        else await _clipboardHistory.ImportDropAsync(e.Data);
+        await ClipboardTrayView.ImportCurrentCategoryDropAsync(e.Data);
     }
 }
 

@@ -742,6 +742,7 @@ public sealed partial class SettingsService : ISettingsService, IAsyncDisposable
 
     private static bool NormalizeSettings(NotchSettings settings)
     {
+        ZuzongLite.Apply(settings);
         bool changed = false;
 
         if (settings.LiquidGlass is null)

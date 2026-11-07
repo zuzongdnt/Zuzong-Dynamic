@@ -58,7 +58,7 @@ public static partial class Loc
     // Only the fallback and the active language are kept in memory. Published as an immutable snapshot
     // (copy on write) so readers on any thread never observe a dictionary that is being modified.
     private static volatile Dictionary<string, Dictionary<string, string>> _strings = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly string[] DefaultLanguageOrder = { "en", "vi", "zh", "pt", "ru", "ar", "ko", "es", "fr", "de", "ja", "hi", "it", "tr", "pl", "nl", "id" };
+    private static readonly string[] DefaultLanguageOrder = { "en", "vi" };
     // Cross-language reverse lookup used only by the settings search. It is built on first use (or prewarmed by
     // the settings window) and released when that window closes, so it does not occupy memory the rest of the time.
     private static Lazy<Dictionary<string, IReadOnlyList<string>>> _translationsByText = NewTranslationIndex();
@@ -259,6 +259,7 @@ public static partial class Loc
 
     private static void RegisterSource(string code, LocaleSource source, Stream stream)
     {
+        if (code is not ("en" or "vi")) return;
         try
         {
             using var doc = JsonDocument.Parse(stream, LocaleJsonOptions);

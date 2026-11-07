@@ -338,7 +338,7 @@ public partial class MainWindow : Window
         _spotlightController = spotlightController;
 
         _mediaDisplayController = new MediaDisplayController();
-        InitializeCameraController();
+        if (!_settings.HideCamera) InitializeCameraController();
         _fullscreenController = new FullscreenAutoHideController(() => _hwnd, _settings,
             isAutoHideSuppressed: () => _isSecondaryView || _transitionCoordinator.TargetView == VNotch.Models.NotchView.Secondary);
         _fullscreenController.HideStateChanged += FullscreenController_HideStateChanged;

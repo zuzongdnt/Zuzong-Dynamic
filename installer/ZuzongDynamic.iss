@@ -1,5 +1,5 @@
 ﻿#ifndef AppVersion
-  #define AppVersion "1.0.5"
+  #define AppVersion "1.1.0"
 #endif
 #ifndef PayloadDir
   #define PayloadDir "..\work\setup-payload"
@@ -28,7 +28,7 @@
 AppId={#ProductId}
 AppName={#ProductName}
 AppVersion={#AppVersion}
-AppVerName={#ProductName} {#AppVersion}
+AppVerName={#ProductName} Lite {#AppVersion}
 AppPublisher=Zuzong
 AppPublisherURL=https://github.com/zuzongdnt
 AppSupportURL=https://github.com/zuzongdnt/Zuzong-Dynamic/issues
@@ -58,7 +58,7 @@ LicenseFile=..\src\ZuzongNotch\LICENSE
 InfoBeforeFile=InstallerNotes.txt
 VersionInfoVersion={#NumericVersion}.0
 VersionInfoCompany=Zuzong
-VersionInfoDescription=Zuzong Dynamic Installer
+VersionInfoDescription=Zuzong Dynamic Lite Installer
 VersionInfoCopyright=Zuzong; based on V-Notch by w0otdev (Apache-2.0)
 Uninstallable=yes
 

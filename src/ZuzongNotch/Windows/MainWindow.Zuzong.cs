@@ -18,7 +18,7 @@ public partial class MainWindow {
   _zuzongCommandStamp=File.GetLastWriteTimeUtc(Path.Combine(ZuzongIntegration.ParentData,"notch-command.json"));
   _zuzongNoticeStamp=File.GetLastWriteTimeUtc(Path.Combine(ZuzongIntegration.ParentData,"notch-notice.json"));
   _transitionCoordinator.StateChanged+=(_,_)=>{ZuzongLogoOverlay.Visibility=ZuzongIntegration.ShowLogo&&!_isExpanded&&!_transitionCoordinator.IsTransitionActive?Visibility.Visible:Visibility.Collapsed;};
-  Title="Zuzong Dynamic Notch";ApplyZuzongFeatures();ApplyZuzongColor();
+  Title=ZuzongLite.ProductName;ApplyZuzongFeatures();ApplyZuzongColor();
   _zuzongTimer=new DispatcherTimer(DispatcherPriority.Background){Interval=TimeSpan.FromMilliseconds(750)};
   _zuzongTimer.Tick+=(_,_)=>PollZuzong();_zuzongTimer.Start();Closed+=(_,_)=>{_zuzongTimer.Stop();DisposeShellHealth();WriteZuzongStatus(true);};WriteZuzongStatus();
  }
@@ -29,7 +29,7 @@ public partial class MainWindow {
   string command=Path.Combine(ZuzongIntegration.ParentData,"notch-command.json");DateTime cmdStamp=File.GetLastWriteTimeUtc(command);
   if(cmdStamp!=_zuzongCommandStamp&&File.Exists(command)&&new FileInfo(command).Length<2048){_zuzongCommandStamp=cmdStamp;if((DateTime.UtcNow-cmdStamp).TotalSeconds<12){using var c=JsonDocument.Parse(File.ReadAllText(command));string? type=c.RootElement.GetProperty("type").GetString();if(type=="appearance")OpenZuzongAppearance();else if(type=="features")OpenZuzongFeatures();else if(type=="settings")OpenAppSettings();}}
   string notice=Path.Combine(ZuzongIntegration.ParentData,"notch-notice.json");DateTime ns=File.GetLastWriteTimeUtc(notice);
-  if(ZuzongIntegration.CodexNotice&&ns!=_zuzongNoticeStamp&&File.Exists(notice)){_zuzongNoticeStamp=ns;if((DateTime.UtcNow-ns).TotalSeconds<12&&new FileInfo(notice).Length<2048){using var n=JsonDocument.Parse(File.ReadAllText(notice));if(n.RootElement.GetProperty("type").GetString()=="codex-complete"){ShowZuzongNotice("Codex đã hoàn tất");_zuzongNotices++;}}}
+  if(ZuzongIntegration.CodexNotice&&ns!=_zuzongNoticeStamp&&File.Exists(notice)){_zuzongNoticeStamp=ns;if((DateTime.UtcNow-ns).TotalSeconds<12&&new FileInfo(notice).Length<2048){using var n=JsonDocument.Parse(File.ReadAllText(notice));if(n.RootElement.GetProperty("type").GetString()=="codex-complete"){ShowZuzongNotice(ZuzongLite.Text("Codex đã hoàn tất","Codex completed"));_zuzongNotices++;}}}
   CheckShellHealth();
   if(++_zuzongTicks%4==0)WriteZuzongStatus();
  }catch(Exception e){RuntimeLog.Error("ZUZONG",e,"Keeping last valid configuration");}}
@@ -44,7 +44,7 @@ public partial class MainWindow {
  internal void ApplyZuzongFeatures(){
   ZuzongIntegration.MusicEnabled=_settings.ZuzongMusic;ZuzongIntegration.HistoryEnabled=_settings.ZuzongClipboardHistory;
   if(!_settings.ZuzongMusic){_mediaService.Stop();MusicViz.IsPlaying=false;_currentMediaInfo=null;CancelPendingMusicCompactExit();ApplyMusicCompactMode(false,null);}else if(_postAppearInitializationStarted)_mediaService.Start();
-  _clipboardHistory!.IsPaused=!_settings.ZuzongClipboardHistory;
+  if(_clipboardHistory!=null)_clipboardHistory.IsPaused=!_settings.ZuzongClipboardHistory;
   if(!_settings.ZuzongBluetooth)_bluetoothModule.Stop();else if(_coreModulesStarted)_bluetoothModule.Start();
   if(!_settings.ShowBatteryIndicator)_batteryModule.Stop();else if(_coreModulesStarted)_batteryModule.Start();
   if(!_settings.ZuzongCalendar)_calendarModule.Stop();
@@ -57,11 +57,9 @@ public partial class MainWindow {
   WhiteNoiseWidget.Visibility=_settings.ZuzongWhiteNoise?Visibility.Visible:Visibility.Collapsed;if(!_settings.ZuzongWhiteNoise)WhiteNoiseService.Pause();
   AllowDrop=_settings.VisibleNavTabs.Split(',').Contains("Secondary");
  }
- VNotch.Windows.ZuzongFeaturesWindow? _zuzongFeatures;
- internal void OpenZuzongFeatures(){if(_zuzongFeatures?.IsVisible==true){_zuzongFeatures.Activate();return;}_zuzongFeatures=new VNotch.Windows.ZuzongFeaturesWindow(this,_settings.Clone()){Owner=this};_zuzongFeatures.Show();}
+ internal void OpenZuzongFeatures()=>OpenAppSettings();
  internal async Task SaveZuzongFeatures(NotchSettings next){await _settingsService.SaveAsync(next);OnSettingsWindowSettingsChanged(null,next);ZuzongIntegration.WriteBasicFromFull(next);ApplyZuzongFeatures();ApplyZuzongColor();}
- VNotch.Windows.ZuzongAppearanceWindow? _zuzongAppearance;
- internal void OpenZuzongAppearance(){if(_zuzongAppearance?.IsVisible==true){_zuzongAppearance.Activate();return;}_zuzongAppearance=new VNotch.Windows.ZuzongAppearanceWindow(this);_zuzongAppearance.Show();}
+ internal void OpenZuzongAppearance()=>OpenAppSettings();
  internal void OpenZuzongAdvanced()=>OpenAppSettings();
  internal void ReloadZuzongAppearance()=>PollZuzong();
  void OpenAppearance_Click(object sender,RoutedEventArgs e)=>OpenZuzongAppearance();

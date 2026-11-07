@@ -50,7 +50,7 @@ public sealed partial class MediaArtworkService : IMediaArtworkService, IDisposa
     private const string ArtworkLogTag = "ARTWORK";
     private const string CropPathLogTag = "CROP-PATH";
     private const long MaxArtworkDownloadSizeBytes = 8 * 1024 * 1024; // 8 MiB
-    private const int MaxDecodePixelDimension = 1024;
+    private const int MaxDecodePixelDimension = 512;
 
     private static readonly HttpClient _httpClient = new(NetworkPrivacy.Handler(NetworkFeature.Artwork));
     private readonly HttpClient _client;
@@ -174,7 +174,7 @@ public sealed partial class MediaArtworkService : IMediaArtworkService, IDisposa
 
     private static readonly Dictionary<CropCacheKey, (BitmapSource Image, DateTime LastAccessedUtc)> _cropCache = new();
     private static readonly object _cropCacheLock = new();
-    private const int MaxCropCacheSize = 24;
+    private const int MaxCropCacheSize = 6;
 
     public BitmapSource? CropToSquare(BitmapSource source, string mediaSource, bool forceCenterCrop = false)
     {
